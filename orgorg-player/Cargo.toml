@@ -1,0 +1,15 @@
+[package]
+name = "orgorg-player"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[dependencies]
+orgorg = { path = "../orgorg" }
+
+md5 = "0.8.0"
+anyhow = "1.0.100"
+clap = { version = "4.5.53", features = ["derive"] }
+cpal = "0.16.0"
+zerocopy = { version = "0.8.31", features = ["derive"] }

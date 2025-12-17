@@ -1,0 +1,7 @@
+[workspace]
+resolver = "3"
+members = ["orgorg", "orgorg-player"]
+
+[profile.release]
+panic = "abort"
+# lto = "thin"
