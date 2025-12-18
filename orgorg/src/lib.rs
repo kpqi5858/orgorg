@@ -66,7 +66,9 @@ impl U8SliceExt for [u8] {
 pub trait CaveStoryAssetProvider {
     /// The original `wavetable.dat` file.
     fn wavetable(&self) -> &[u8; 25600];
-    /// 6 drum samples concatenated.
+    /// 6 pxt samples concatenated.
+    ///
+    /// Order is: fx96, fx97, fx9a, fx98, fx99, fx9b
     fn drum(&self) -> &[u8; 40000];
 }
 
