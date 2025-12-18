@@ -174,9 +174,11 @@ fn dump_and_synth(file: &Path) -> Result<AssetByDump> {
         anyhow::bail!("Invalid Doukutsu.exe (checksum mismatch)");
     }
 
-    let wavetable: [u8; 25600] = file[0x9b3a8..0xa17a8]
+    let wavetable: [u8; 25600] = file
+        .get(0x9b3a8..0xa17a8)
+        .context("Cannot extract wavetable.dat")?
         .try_into()
-        .context("Cannot extract wavetable.dat")?;
+        .unwrap();
 
     const PXTS: [(usize, usize); 6] = [
         (2, 0x0922d0), // 0x96
