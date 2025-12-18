@@ -78,11 +78,10 @@ fn find_config(device: &Device, config: &AudioConfig) -> Result<StreamConfig> {
 
 fn player(
     device: &Device,
-    config: &AudioConfig,
+    config: StreamConfig,
     org: Vec<u8>,
     control: Arc<PlayerControl>,
 ) -> Result<()> {
-    let config = find_config(device, config)?;
     let channels = config.channels;
 
     // Here I ran into classic Rust pitfall!
@@ -218,15 +217,19 @@ fn main() -> Result<()> {
             Ok(())
         }
         Commands::Play { path, config } => {
+            let org = std::fs::read(path).context("Cannot open .org file")?;
+
             let channels = if config.mono { 1 } else { 2 };
             let rate = config.rate;
             let device = cpal::default_host()
                 .default_output_device()
                 .context("Cannot find audio output device")?;
-            let org = std::fs::read(path).context("Cannot open .org file")?;
+            let config = find_config(&device, &config)?;
             let control: Arc<PlayerControl> = Arc::default();
             let control_clone = control.clone();
-            std::thread::spawn(move || player(&device, &config, org, control_clone));
+
+            std::thread::spawn(move || player(&device, config, org, control_clone));
+
             let mut stdout = stdout();
             let tick_rate = Duration::from_millis(50);
             loop {
