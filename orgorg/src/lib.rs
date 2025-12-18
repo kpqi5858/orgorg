@@ -12,7 +12,7 @@
 
 use core::{cmp, marker::PhantomData};
 
-pub const DRUM_LEN: [usize; 6] = [5000, 10000, 10000, 1000, 10000, 4000];
+const DRUM_LEN: [usize; 6] = [5000, 10000, 10000, 1000, 10000, 4000];
 const DRUM_OFFSET: [usize; 7] = [0, 5000, 15000, 25000, 26000, 36000, 40000];
 
 // For more cleaner internal code. not for pub.
