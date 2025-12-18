@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -87,7 +87,8 @@ fn player(
     // Here I ran into classic Rust pitfall!
     // I want to send OrgPlayer to cpal thread and there is just no way of doing it.
     // Vec::leak(org) is rough solution but will cause memory leak,
-    // The best answer is a crate that lets you use self-referential struct safely.
+    // Keeping the player and sending synthesized audio data by ringbuf is a valid solution.
+    // But probably the simplest answer is a crate that lets you use self-referential struct safely.
     type DefaultOrgPlay<'a> = OrgPlay<'a, Linear, &'static AssetByDump>;
     self_cell::self_cell!(
         struct OwnedOrgPlay {
@@ -145,9 +146,9 @@ fn player(
 struct PlayerControl {
     paused: AtomicBool,
     exit: AtomicBool,
-    cur_beat: AtomicI32,
-    loop_start: AtomicI32,
-    loop_end: AtomicI32,
+    cur_beat: AtomicU32,
+    loop_start: AtomicU32,
+    loop_end: AtomicU32,
     played_samples: AtomicU64,
 }
 
