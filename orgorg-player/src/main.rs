@@ -81,6 +81,7 @@ fn player(
     config: StreamConfig,
     org: Vec<u8>,
     control: Arc<PlayerControl>,
+    exit: oneshot::Receiver<()>,
 ) -> Result<()> {
     let channels = config.channels;
 
@@ -112,7 +113,7 @@ fn player(
     let stream = device.build_output_stream(
         &config,
         move |data: &mut [f32], _| {
-            if ctrl.paused.load(Ordering::Relaxed) || ctrl.exit.load(Ordering::Relaxed) {
+            if ctrl.paused.load(Ordering::Relaxed) {
                 return;
             }
             player.with_dependent_mut(|_, player| {
@@ -133,19 +134,16 @@ fn player(
     )?;
     stream.play()?;
 
-    loop {
-        if control.exit.load(Ordering::Relaxed) {
-            drop(stream);
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    // Don't care, received message either sender is dropped
+    let _ = exit.recv();
+    // Be explicit
+    drop(stream);
+    Ok(())
 }
 
 #[derive(Default)]
 struct PlayerControl {
     paused: AtomicBool,
-    exit: AtomicBool,
     cur_beat: AtomicU32,
     loop_start: AtomicU32,
     loop_end: AtomicU32,
@@ -228,8 +226,11 @@ fn main() -> Result<()> {
             let config = find_config(&device, &config)?;
             let control: Arc<PlayerControl> = Arc::default();
             let control_clone = control.clone();
+            let (_exit, exit_receiver) = oneshot::channel();
 
-            let join = std::thread::spawn(move || player(&device, config, org, control_clone));
+            let join = std::thread::spawn(move || {
+                player(&device, config, org, control_clone, exit_receiver)
+            });
 
             let mut stdout = stdout();
             let tick_rate = Duration::from_millis(50);
