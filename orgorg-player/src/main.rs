@@ -18,7 +18,7 @@ use cpal::{
     Device, SampleRate, StreamConfig,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
-use orgorg::{CaveStoryAssetProvider, OrgPlayBuilder};
+use orgorg::{CaveStoryAssetProvider, OrgPlay, OrgPlayBuilder, interp_impls::Linear};
 
 use crate::pxt::synth_pxt;
 
@@ -82,42 +82,44 @@ fn player(
     org: Vec<u8>,
     control: Arc<PlayerControl>,
 ) -> Result<()> {
-    // To avoid memory allocation per buffer sent to cpal thread,
-    // Define one channel for sending fresh buffer,
-    // and another channel for receiving buffer need to refreshed.
-    // It would be much simpler if cpal data buffer size is static and can be known ahead..
-    let (send, receive) = std::sync::mpsc::sync_channel::<(Vec<f32>, usize)>(1);
-    let (send2, receive2) = std::sync::mpsc::sync_channel::<(Vec<f32>, usize)>(1);
-
     let config = find_config(device, config)?;
 
-    let mut player = OrgPlayBuilder::new()
-        .with_asset_provider(ASSET_BY_DUMP.get().unwrap())
-        .with_sample_rate(config.sample_rate.0)
-        .build(&org);
-    let channels = config.channels as usize;
-    let buffer_size = 512 * channels;
+    // Here I ran into classic Rust pitfall!
+    // I want to send OrgPlayer to cpal thread and there is just no way of doing it.
+    // Vec::leak(org) is rough solution but will cause memory leak,
+    // The best answer is a crate that lets you use self-referential struct safely.
+    type DefaultOrgPlay<'a> = OrgPlay<'a, Linear, &'static AssetByDump>;
+    self_cell::self_cell!(
+        struct OwnedOrgPlay {
+            owner: Vec<u8>,
+            #[covariant]
+            dependent: DefaultOrgPlay,
+        }
+    );
+    let mut player = OwnedOrgPlay::new(org, |v| {
+        let player = OrgPlayBuilder::new()
+            .with_asset_provider(ASSET_BY_DUMP.get().unwrap())
+            .with_sample_rate(config.sample_rate.0)
+            .build(v);
+        let (loop_start, loop_end) = player.get_loop();
+        control.loop_start.store(loop_start, Ordering::Relaxed);
+        control.loop_end.store(loop_end, Ordering::Relaxed);
+        player
+    });
 
-    let control_clone = control.clone();
+    let ctrl = control.clone();
     let stream = device.build_output_stream(
         &config,
         move |data: &mut [f32], _| {
-            let mut filled = 0;
-            while filled < data.len() {
-                let Ok((buf, mut read_till)) = receive.recv() else {
-                    return;
-                };
-                let min = std::cmp::min(data.len() - filled, buf.len() - read_till);
-                data[filled..filled + min].copy_from_slice(&buf[read_till..read_till + min]);
-                filled += min;
-                read_till += min;
-                if send2.send((buf, read_till)).is_err() {
-                    return;
-                }
+            if ctrl.paused.load(Ordering::Relaxed) || ctrl.exit.load(Ordering::Relaxed) {
+                return;
             }
-            control_clone
-                .played_samples
-                .fetch_add(data.len() as u64, Ordering::Relaxed);
+            player.with_dependent_mut(|_, player| {
+                player.synth_stereo(data);
+                ctrl.played_samples
+                    .fetch_add(data.len() as u64, Ordering::Relaxed);
+                ctrl.cur_beat.store(player.get_beat(), Ordering::Relaxed);
+            });
         },
         |err| {
             eprintln!("{err}");
@@ -126,34 +128,12 @@ fn player(
     )?;
     stream.play()?;
 
-    send.send((vec![0.0; buffer_size], buffer_size)).unwrap();
     loop {
         if control.exit.load(Ordering::Relaxed) {
-            drop(receive2);
-            drop(send);
             drop(stream);
             return Ok(());
         }
-        let (mut buf, mut read_till) = receive2.recv().unwrap();
-        if read_till == buf.len() {
-            if control.paused.load(Ordering::Relaxed) {
-                buf.fill(0.0);
-            } else {
-                if channels == 1 {
-                    player.synth_mono(&mut buf);
-                } else if channels == 2 {
-                    player.synth_stereo(&mut buf);
-                } else {
-                    unreachable!();
-                }
-                control.cur_beat.store(player.get_beat(), Ordering::Relaxed);
-                let (loop_start, loop_end) = player.get_loop();
-                control.loop_start.store(loop_start, Ordering::Relaxed);
-                control.loop_end.store(loop_end, Ordering::Relaxed);
-            }
-            read_till = 0;
-        }
-        send.send((buf, read_till)).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -168,7 +148,7 @@ struct PlayerControl {
 }
 
 #[derive(Debug)]
-struct AssetByDump(Box<[u8; 25600]>, Box<[u8; 40000]>);
+struct AssetByDump([u8; 25600], [u8; 40000]);
 
 impl CaveStoryAssetProvider for &AssetByDump {
     fn wavetable(&self) -> &[u8; 25600] {
@@ -213,7 +193,7 @@ fn dump_and_synth(file: &Path) -> Result<AssetByDump> {
     let drums: [i8; 40000] = drums.try_into().ok().context("Invalid drums length")?;
     let drums: [u8; 40000] = zerocopy::transmute!(drums);
 
-    Ok(AssetByDump(Box::new(wavetable), Box::new(drums)))
+    Ok(AssetByDump(wavetable, drums))
 }
 
 fn main() -> Result<()> {
