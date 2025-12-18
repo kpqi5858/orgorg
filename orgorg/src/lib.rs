@@ -18,7 +18,8 @@ const DRUM_OFFSET: [usize; 7] = [0, 5000, 15000, 25000, 26000, 36000, 40000];
 // For more cleaner internal code. not for pub.
 trait U8SliceExt {
     fn read_i16(&self, offset: usize) -> i16;
-    fn read_i32(&self, offset: usize) -> i32;
+    fn read_u16(&self, offset: usize) -> u16;
+    fn read_u32(&self, offset: usize) -> u32;
     fn read_i8(&self, offset: usize) -> i8;
 }
 
@@ -28,8 +29,12 @@ impl U8SliceExt for [u8] {
         i16::from_le_bytes(self[offset..offset + 2].try_into().unwrap())
     }
     #[inline]
-    fn read_i32(&self, offset: usize) -> i32 {
-        i32::from_le_bytes(self[offset..offset + 4].try_into().unwrap())
+    fn read_u16(&self, offset: usize) -> u16 {
+        u16::from_le_bytes(self[offset..offset + 2].try_into().unwrap())
+    }
+    #[inline]
+    fn read_u32(&self, offset: usize) -> u32 {
+        u32::from_le_bytes(self[offset..offset + 4].try_into().unwrap())
     }
     #[inline]
     fn read_i8(&self, offset: usize) -> i8 {
@@ -178,11 +183,12 @@ struct Event {
 struct Instrument<'a, I: OrgInterpolation, const DRUM: bool> {
     inst_data: &'a [u8],
     tuning: i16,
-    pi: bool,
-    n_events: i16,
-    cur_event: i16,
+    // cur_event: Option<i16> is ergonomic but this saves space
+    pi_loop_calculated: u8,
+    n_events: u16,
+    cur_event: u16,
     // TODO: Pre-calculate this value, not on the fly
-    loop_event: i16,
+    loop_event: u16,
     phase_inc: f32,
     phase_acc: f32,
     cur_pan: u8,
@@ -193,12 +199,14 @@ struct Instrument<'a, I: OrgInterpolation, const DRUM: bool> {
 }
 
 impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
-    fn get_cur_event_beat(&self, inst_data: &[u8]) -> i32 {
+    fn get_cur_event_beat(&self) -> u32 {
+        debug_assert!(self.cur_event < self.n_events);
         let pos = self.cur_event as usize * 4;
-        inst_data.read_i32(pos)
+        self.inst_data.read_u32(pos)
     }
 
-    fn get_cur_event(&self, inst_data: &[u8]) -> Event {
+    fn get_cur_event(&self) -> Event {
+        let inst_data = self.inst_data;
         let n_events = self.n_events as usize;
         let mut pos = n_events * 4 + self.cur_event as usize;
         let note = inst_data[pos];
@@ -216,11 +224,10 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
         }
     }
 
-    fn tick(&mut self, (cur_beat, loop_start, samples_per_beat, rate): &(i32, i32, f32, u32)) {
+    fn tick(&mut self, (cur_beat, loop_start, samples_per_beat, rate): &(u32, u32, f32, u32)) {
         if self.n_events == 0 {
             return;
         }
-        let inst_data = self.inst_data;
         let rate = *rate as f32;
         // There is no official documentation for .org file,
         // and these logics are not designed to handle it as leniently as possible.
@@ -230,15 +237,19 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
         // Unofficial reference
         // https://gist.github.com/fdeitylink/7fc9ddcc54b33971e5f505c8da2cfd28
         if cur_beat == loop_start {
-            if self.loop_event == -1 {
-                self.loop_event = self.cur_event;
-            } else {
+            if self.pi_loop_calculated & 2 == 2 {
                 self.cur_event = self.loop_event;
+            } else {
+                self.loop_event = self.cur_event;
+                self.pi_loop_calculated |= 2;
             }
         }
-        let cur_event_beat = self.get_cur_event_beat(inst_data);
+        if self.cur_event >= self.n_events {
+            return;
+        }
+        let cur_event_beat = self.get_cur_event_beat();
         let event = if cur_event_beat == *cur_beat {
-            self.get_cur_event(inst_data)
+            self.get_cur_event()
         } else {
             return;
         };
@@ -276,7 +287,7 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
                     self.phase_inc.is_finite() && 0.0 <= self.phase_inc && self.phase_inc < 256.0,
                     "Pitch out of RATE"
                 );
-                self.cur_len = if self.pi {
+                self.cur_len = if (self.pi_loop_calculated & 1) == 1 {
                     (1024.0 / self.phase_inc) as u32
                 } else {
                     (event.length as f32 * samples_per_beat) as u32
@@ -352,9 +363,9 @@ pub struct OrgPlay<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> {
     sample_rate: u32,
     samples_per_beat: f32,
     remaining_samples: f32,
-    loop_start: i32,
-    loop_end: i32,
-    cur_beat: i32,
+    loop_start: u32,
+    loop_end: u32,
+    cur_beat: u32,
     wave_ins: [Instrument<'a, I, false>; 8],
     drum_ins: [Instrument<'a, I, true>; 8],
     asset: A,
@@ -365,19 +376,20 @@ impl<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> OrgPlay<'a, I, A> {
         assert_eq!(&song[0..6], b"Org-02", "Header mismatch");
         let ms_per_beat = song.read_i16(6);
         let samples_per_beat = ms_per_beat as f32 * (rate as f32 / 1000.0);
-        let loop_start = song.read_i32(10);
-        let loop_end = song.read_i32(14);
+        let loop_start = song.read_u32(10);
+        let loop_end = song.read_u32(14);
 
         let mut offset = 18;
         let mut ins_data_offset = 114;
         let tick_args = &(0, loop_start, samples_per_beat, rate);
         let wave_ins = core::array::from_fn(|_| {
             let wave = song.read_i8(offset + 2);
-            let n_events = song.read_i16(offset + 4);
+            let n_events = song.read_u16(offset + 4);
+            let pi = if song.read_i8(offset + 3) != 0 { 1 } else { 0 };
             let mut ret = Instrument {
                 inst_data: &song[ins_data_offset..ins_data_offset + n_events as usize * 8],
                 tuning: song.read_i16(offset),
-                pi: song.read_i8(offset + 3) != 0,
+                pi_loop_calculated: pi,
                 n_events,
                 phase_inc: 0.0,
                 phase_acc: 0.0,
@@ -385,7 +397,7 @@ impl<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> OrgPlay<'a, I, A> {
                 cur_vol: 0,
                 cur_len: 0,
                 cur_event: 0,
-                loop_event: -1,
+                loop_event: 0,
                 wave_idx: wave,
                 _i: PhantomData,
             };
@@ -399,11 +411,12 @@ impl<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> OrgPlay<'a, I, A> {
             // -1 means there is no corresponding drum effect.
             let wave =
                 [0, -1, 1, -1, 2, 3, 4, -1, 5, -1, -1, -1][song.read_i8(offset + 2) as usize];
-            let n_events = song.read_i16(offset + 4);
+            let n_events = song.read_u16(offset + 4);
+            let pi = if song.read_i8(offset + 3) != 0 { 1 } else { 0 };
             let mut ret = Instrument {
                 inst_data: &song[ins_data_offset..ins_data_offset + n_events as usize * 8],
                 tuning: song.read_i16(offset),
-                pi: song.read_i8(offset + 3) != 0,
+                pi_loop_calculated: pi,
                 // And it won't produce a sound.
                 n_events: if wave == -1 { 0 } else { n_events },
                 phase_inc: 0.0,
@@ -412,7 +425,7 @@ impl<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> OrgPlay<'a, I, A> {
                 cur_vol: 0,
                 cur_len: 0,
                 cur_event: 0,
-                loop_event: -1,
+                loop_event: 0,
                 wave_idx: wave,
                 _i: PhantomData,
             };
@@ -516,12 +529,12 @@ impl<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> OrgPlay<'a, I, A> {
     }
 
     /// Returns (Loop Start, Loop End).
-    pub fn get_loop(&self) -> (i32, i32) {
+    pub fn get_loop(&self) -> (u32, u32) {
         (self.loop_start, self.loop_end)
     }
 
     /// Returns current beat.
-    pub fn get_beat(&self) -> i32 {
+    pub fn get_beat(&self) -> u32 {
         self.cur_beat
     }
 
