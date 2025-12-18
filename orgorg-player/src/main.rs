@@ -228,7 +228,7 @@ fn main() -> Result<()> {
             let control: Arc<PlayerControl> = Arc::default();
             let control_clone = control.clone();
 
-            std::thread::spawn(move || player(&device, config, org, control_clone));
+            let join = std::thread::spawn(move || player(&device, config, org, control_clone));
 
             let mut stdout = stdout();
             let tick_rate = Duration::from_millis(50);
@@ -246,6 +246,11 @@ fn main() -> Result<()> {
                     .as_bytes(),
                 )?;
                 stdout.flush()?;
+
+                if join.is_finished() {
+                    return join.join().unwrap();
+                }
+
                 std::thread::sleep(tick_rate);
             }
         }
