@@ -83,6 +83,7 @@ fn player(
     control: Arc<PlayerControl>,
 ) -> Result<()> {
     let config = find_config(device, config)?;
+    let channels = config.channels;
 
     // Here I ran into classic Rust pitfall!
     // I want to send OrgPlayer to cpal thread and there is just no way of doing it.
@@ -115,7 +116,11 @@ fn player(
                 return;
             }
             player.with_dependent_mut(|_, player| {
-                player.synth_stereo(data);
+                match channels {
+                    1 => player.synth_mono(data),
+                    2 => player.synth_stereo(data),
+                    _ => (),
+                }
                 ctrl.played_samples
                     .fetch_add(data.len() as u64, Ordering::Relaxed);
                 ctrl.cur_beat.store(player.get_beat(), Ordering::Relaxed);
