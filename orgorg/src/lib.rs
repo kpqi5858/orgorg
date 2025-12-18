@@ -247,13 +247,8 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
             self.cur_vol = event.volume;
         }
         if event.panning != 255 {
-            self.cur_pan = event.panning;
-            let left = if self.cur_pan > 6 {
-                12 - self.cur_pan
-            } else {
-                6
-            };
-            let right = if self.cur_pan < 6 { self.cur_pan } else { 6 };
+            let left = (12 - event.panning).min(6);
+            let right = event.panning.min(6);
             self.cur_pan = (left << 4) | right;
         }
         if event.note != 255 {
@@ -529,6 +524,8 @@ impl<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> OrgPlay<'a, I, A> {
     pub fn get_beat(&self) -> i32 {
         self.cur_beat
     }
+
+    // TODO: Seek function
 }
 
 /// Builder for [`OrgPlay`].
@@ -580,9 +577,7 @@ where
     I: OrgInterpolation,
     A: CaveStoryAssetProvider,
 {
-    // TODO: Verify the song and return Result, then do unchecked access freely later.
-    // But unchecked access can be slower, because of strong guarantees with references,
-    // which compiler can optimize better as I'm primarilly relying on compiler optimizations.
+    // TODO: Write a validator
     pub fn build<'a>(self, song: &'a [u8]) -> OrgPlay<'a, I, A> {
         OrgPlay::<I, A>::new(self.1, song, self.2)
     }
