@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["orgorg", "orgorg-player"]
+members = ["orgorg", "orgorg-player", "orgorg-bench"]
 
 [profile.release]
 panic = "abort"

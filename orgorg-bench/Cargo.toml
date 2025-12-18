@@ -1,0 +1,14 @@
+[package]
+name = "orgorg-bench"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[dependencies]
+orgorg = { path = "../orgorg" }
+criterion = "0.8.1"
+
+[[bench]]
+name = "bench"
+harness = false
