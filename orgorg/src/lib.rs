@@ -152,8 +152,9 @@ pub mod interp_impls {
                 // naive `pos % 1.0` is **300% slower**..WTF?
                 // `pos - libm::truncf(pos)` is 20% slower.
                 // f32::to_int_unchecked is another significant speedup.
-                let frac = pos - (pos.to_int_unchecked::<i32>() as f32);
-                let pos_idx = pos.to_int_unchecked::<usize>();
+                let pos_i = pos.to_int_unchecked::<i32>();
+                let frac = pos - (pos_i as f32);
+                let pos_idx = pos_i as usize;
                 let sample1 = *wave.get_unchecked(pos_idx);
                 let sample2 = *wave.get_unchecked((pos_idx.unchecked_add(1)) % len);
                 // The "imprecise" lerp (see Wikipedia Linear Interpolation).
@@ -335,10 +336,10 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
         // Safety: CaveStoryAssetProviderExt never return empty array.
         // This will eliminate "rem by zero" panic code.
         unsafe { core::hint::assert_unchecked(len != 0) }
+        let vol = self.cur_vol as i32;
         // Integer multiplication then float cast is slightly faster
-        let left = ((self.cur_pan >> 4) as i32 * self.cur_vol as i32) as f32 * MASTER_VOLUME;
-        let right =
-            ((self.cur_pan & 0b00001111) as i32 * self.cur_vol as i32) as f32 * MASTER_VOLUME;
+        let left = ((self.cur_pan >> 4) as i32 * vol) as f32 * MASTER_VOLUME;
+        let right = ((self.cur_pan & 0b00001111) as i32 * vol) as f32 * MASTER_VOLUME;
         let mono = (self.cur_vol as i32) as f32 * 6.0 * MASTER_VOLUME;
         let n = if MONO {
             cmp::min(buf.len(), self.cur_len as usize)
@@ -581,7 +582,7 @@ impl<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> OrgPlay<'a, I, A> {
         self.cur_beat
     }
 
-    // TODO: Seek function
+    // TODO: Seek function (Will be expensive)
 }
 
 /// Builder for [`OrgPlay`].
