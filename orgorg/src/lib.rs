@@ -10,8 +10,9 @@
 //!
 //! This crate uses some unsafe in critical areas to boost the performance. I tried to ensure correctness but, who knows.
 
-use core::{cmp, marker::PhantomData};
+use core::{cmp, marker::PhantomData, ptr::NonNull};
 
+const MASTER_VOLUME: f32 = 0.25 / 65536.0;
 const DRUM_LEN: [usize; 6] = [5000, 10000, 10000, 1000, 10000, 4000];
 const DRUM_OFFSET: [usize; 7] = [0, 5000, 15000, 25000, 26000, 36000, 40000];
 
@@ -136,6 +137,7 @@ pub trait OrgInterpolation {
     unsafe fn interpolate(wave: &[i8], pos: f32) -> f32;
 }
 
+/// Builtin [`OrgInterpolation`] implementations.
 pub mod interp_impls {
     use super::OrgInterpolation;
     /// Linear Interpolation.
@@ -153,10 +155,10 @@ pub mod interp_impls {
                 let frac = pos - (pos.to_int_unchecked::<i32>() as f32);
                 let pos_idx = pos.to_int_unchecked::<usize>();
                 let sample1 = *wave.get_unchecked(pos_idx);
-                let sample2 = *wave.get_unchecked((pos_idx + 1) % len);
+                let sample2 = *wave.get_unchecked((pos_idx.unchecked_add(1)) % len);
                 // The "imprecise" lerp (see Wikipedia Linear Interpolation).
                 // Monotonic, and slightly fast over "precise" one.
-                sample1 as f32 + (sample2 as i32 - sample1 as i32) as f32 * frac
+                sample1 as f32 + ((sample2 as i32).unchecked_sub(sample1 as i32)) as f32 * frac
             }
         }
     }
@@ -183,10 +185,16 @@ struct Event {
 }
 
 struct Instrument<'a, I: OrgInterpolation, const DRUM: bool> {
-    inst_data: &'a [u8],
+    // Must be:
+    // - If n_events is 0, this pointer can be dangling so never access it
+    // - else, this is a start of slice with length of n_events * 8
+    inst_data_ptr: NonNull<u8>,
     tuning: i16,
-    // cur_event: Option<i16> is ergonomic but this saves space
+    // loop_event: Option<i16> is ergonomic but this saves space
     pi_loop_calculated: u8,
+    // Supposedly the maximum number of events in a single instrument is 256.
+    // Some incompatible(non-standard?) music can exceed that arbitrary limit.
+    // So, be lenient here.
     n_events: u16,
     cur_event: u16,
     // TODO: Pre-calculate this value, not on the fly
@@ -198,39 +206,48 @@ struct Instrument<'a, I: OrgInterpolation, const DRUM: bool> {
     wave_idx: i8,
     cur_len: u32,
     _i: PhantomData<I>,
+    _a: PhantomData<&'a [u8]>,
 }
 
+unsafe impl<'a, I: OrgInterpolation, const DRUM: bool> Send for Instrument<'a, I, DRUM> {}
+unsafe impl<'a, I: OrgInterpolation, const DRUM: bool> Sync for Instrument<'a, I, DRUM> {}
+
 impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
-    fn get_cur_event_beat(&self) -> u32 {
+    // Safety: cur_event < n_events
+    unsafe fn get_cur_event_beat(&self) -> u32 {
         debug_assert!(self.cur_event < self.n_events);
-        let pos = self.cur_event as usize * 4;
-        self.inst_data.read_u32(pos)
+        // Safety: See inst_data_ptr field comment
+        unsafe {
+            self.inst_data_ptr
+                .add(self.cur_event as usize * 4)
+                .cast()
+                .read_unaligned()
+        }
     }
 
-    fn get_cur_event(&self) -> Event {
-        let inst_data = self.inst_data;
-        let n_events = self.n_events as usize;
-        let mut pos = n_events * 4 + self.cur_event as usize;
-        let note = inst_data[pos];
-        pos += n_events;
-        let length = inst_data[pos];
-        pos += n_events;
-        let volume = inst_data[pos];
-        pos += n_events;
-        let panning = inst_data[pos];
-        Event {
-            note,
-            length,
-            volume,
-            panning,
+    // Safety: cur_event < n_events
+    unsafe fn get_cur_event(&self) -> Event {
+        debug_assert!(self.cur_event < self.n_events);
+        // Safety: See inst_data_ptr field comment
+        unsafe {
+            let n_events = self.n_events as usize;
+            let inst_ptr = self
+                .inst_data_ptr
+                .add(n_events * 4 + self.cur_event as usize);
+            let note = inst_ptr.read();
+            let length = inst_ptr.add(n_events).read();
+            let volume = inst_ptr.add(n_events * 2).read();
+            let panning = inst_ptr.add(n_events * 3).read();
+            Event {
+                note,
+                length,
+                volume,
+                panning,
+            }
         }
     }
 
     fn tick(&mut self, (cur_beat, loop_start, samples_per_beat, rate): &(u32, u32, f32, u32)) {
-        if self.n_events == 0 {
-            return;
-        }
-        let rate = *rate as f32;
         // There is no official documentation for .org file,
         // and these logics are not designed to handle it as leniently as possible.
         // It assumes that event is sorted by its beat, and no more event after loop_end.
@@ -249,11 +266,14 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
         if self.cur_event >= self.n_events {
             return;
         }
-        let cur_event_beat = self.get_cur_event_beat();
-        let event = if cur_event_beat == *cur_beat {
-            self.get_cur_event()
-        } else {
-            return;
+        // Safety: Checked with above code
+        let event = unsafe {
+            let cur_event_beat = self.get_cur_event_beat();
+            if cur_event_beat == *cur_beat {
+                self.get_cur_event()
+            } else {
+                return;
+            }
         };
         self.cur_event += 1;
         if event.volume != 255 {
@@ -265,6 +285,7 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
             self.cur_pan = (left << 4) | right;
         }
         if event.note != 255 {
+            let rate = *rate as f32;
             self.phase_acc = 0.0;
             if DRUM {
                 let wave_len = DRUM_LEN[self.wave_idx as usize];
@@ -301,7 +322,6 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
     // This function is the critical part of overall performance.
     // Previously, there was val() method that returns a sample value, which was obviously slower.
     // And as expected, fill_buf is ~1.6x faster than individual val() calls
-    #[inline(always)]
     fn fill_buf<A: CaveStoryAssetProvider, const MONO: bool>(&mut self, buf: &mut [f32], a: &A) {
         if self.cur_len == 0 {
             return;
@@ -316,9 +336,10 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
         // This will eliminate "rem by zero" panic code.
         unsafe { core::hint::assert_unchecked(len != 0) }
         // Integer multiplication then float cast is slightly faster
-        let left = ((self.cur_pan >> 4) as i32 * self.cur_vol as i32) as f32;
-        let right = ((self.cur_pan & 0b00001111) as i32 * self.cur_vol as i32) as f32;
-        let mono = (self.cur_vol as i32) as f32 * 6.0;
+        let left = ((self.cur_pan >> 4) as i32 * self.cur_vol as i32) as f32 * MASTER_VOLUME;
+        let right =
+            ((self.cur_pan & 0b00001111) as i32 * self.cur_vol as i32) as f32 * MASTER_VOLUME;
+        let mono = (self.cur_vol as i32) as f32 * 6.0 * MASTER_VOLUME;
         let n = if MONO {
             cmp::min(buf.len(), self.cur_len as usize)
         } else {
@@ -335,11 +356,14 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
                 debug_assert!(pos.is_finite() && 0.0 <= pos && pos < len as f32);
                 I::interpolate(cur_wave, pos)
             };
-            if MONO {
-                buf[i] += sample * mono;
-            } else {
-                buf[i * 2] += sample * left;
-                buf[i * 2 + 1] += sample * right;
+            // Seems compiler can't prove that no out of bounds will happen here. Interesting.
+            unsafe {
+                if MONO {
+                    *buf.get_unchecked_mut(i) += sample * mono;
+                } else {
+                    *buf.get_unchecked_mut(i * 2) += sample * left;
+                    *buf.get_unchecked_mut(i * 2 + 1) += sample * right;
+                }
             }
             // It actually produces audible pitch instability as number builds up.
             // So, naively wrap the value before it becomes too inaccurate.
@@ -357,7 +381,7 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
 
 /// `no_std` compatible Cave Story Organya Music Player.
 ///
-/// Based on my JavaScript OrgPlay, which is based on bisqwit's C++ OrgPlay.
+/// Based on bisqwit's C++ OrgPlay.
 ///
 /// **Can panic anytime if song is invalid.**
 pub struct OrgPlay<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> {
@@ -388,8 +412,15 @@ impl<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> OrgPlay<'a, I, A> {
             let wave = song.read_i8(offset + 2);
             let n_events = song.read_u16(offset + 4);
             let pi = if song.read_i8(offset + 3) != 0 { 1 } else { 0 };
+            let inst_data_ptr = if n_events == 0 {
+                NonNull::dangling()
+            } else {
+                let inst_data = &song[ins_data_offset..ins_data_offset + n_events as usize * 8];
+                // Safety: slice is always valid, and bound checked
+                unsafe { NonNull::new_unchecked(inst_data.as_ptr() as *mut u8) }
+            };
             let mut ret = Instrument {
-                inst_data: &song[ins_data_offset..ins_data_offset + n_events as usize * 8],
+                inst_data_ptr,
                 tuning: song.read_i16(offset),
                 pi_loop_calculated: pi,
                 n_events,
@@ -402,6 +433,7 @@ impl<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> OrgPlay<'a, I, A> {
                 loop_event: 0,
                 wave_idx: wave,
                 _i: PhantomData,
+                _a: PhantomData,
             };
             // Initial ticking for beat 0, since synth function will start ticking at beat 1
             ret.tick(tick_args);
@@ -415,8 +447,15 @@ impl<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> OrgPlay<'a, I, A> {
                 [0, -1, 1, -1, 2, 3, 4, -1, 5, -1, -1, -1][song.read_i8(offset + 2) as usize];
             let n_events = song.read_u16(offset + 4);
             let pi = if song.read_i8(offset + 3) != 0 { 1 } else { 0 };
+            let inst_data_ptr = if n_events == 0 {
+                NonNull::dangling()
+            } else {
+                let inst_data = &song[ins_data_offset..ins_data_offset + n_events as usize * 8];
+                // Safety: slice is always valid, and bound checked
+                unsafe { NonNull::new_unchecked(inst_data.as_ptr() as *mut u8) }
+            };
             let mut ret = Instrument {
-                inst_data: &song[ins_data_offset..ins_data_offset + n_events as usize * 8],
+                inst_data_ptr,
                 tuning: song.read_i16(offset),
                 pi_loop_calculated: pi,
                 // And it won't produce a sound.
@@ -430,11 +469,12 @@ impl<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> OrgPlay<'a, I, A> {
                 loop_event: 0,
                 wave_idx: wave,
                 _i: PhantomData,
+                _a: PhantomData,
             };
             // Initial ticking for beat 0, since synth function will start ticking at beat 1
             ret.tick(tick_args);
             offset += 6;
-            ins_data_offset += 8 * ret.n_events as usize;
+            ins_data_offset += 8 * n_events as usize;
             ret
         });
         Self {
@@ -467,7 +507,6 @@ impl<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> OrgPlay<'a, I, A> {
         if !MONO {
             assert!(buf.len().is_multiple_of(2));
         }
-        const MASTER_VOLUME: f32 = 0.25 / 65536.0;
         buf.fill(0.0);
         let mut filled_raw = 0;
         while filled_raw < buf.len() {
@@ -512,7 +551,8 @@ impl<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> OrgPlay<'a, I, A> {
                     buf.len() - filled_raw,
                 )
             };
-            let fill_buffer = &mut buf[from_raw..from_raw + to_fill_raw];
+            // Seems compiler can't prove that no out of bounds will happen here as well.
+            let fill_buffer = unsafe { buf.get_unchecked_mut(from_raw..from_raw + to_fill_raw) };
             for w in &mut self.wave_ins {
                 w.fill_buf::<A, MONO>(fill_buffer, &self.asset);
             }
@@ -527,7 +567,8 @@ impl<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> OrgPlay<'a, I, A> {
                 self.remaining_samples -= (to_fill_raw / 2) as f32;
             }
         }
-        buf.iter_mut().for_each(|f| *f *= MASTER_VOLUME);
+        // Multiplying MASTER_VOLUME in fill_buf is somewhat faster
+        // buf.iter_mut().for_each(|f| *f *= MASTER_VOLUME);
     }
 
     /// Returns (Loop Start, Loop End).
