@@ -286,36 +286,35 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
             self.cur_pan = (left << 4) | right;
         }
         if event.note != 255 {
-            let rate = *rate as f32;
+            self.cur_len = 0;
             self.phase_acc = 0.0;
+            let rate = *rate as f32;
             if DRUM {
                 let wave_len = DRUM_LEN[self.wave_idx as usize];
-                self.phase_inc = event.note as f32 * (22050.0 / 32.5) / rate;
+                let phase_inc = event.note as f32 * (22050.0 / 32.5) / rate;
                 // This is needed for OrgInterpolation trait invariant.
-                // Valid org song with sufficiently high RATE should not fail this assert.
-                assert!(
-                    self.phase_inc.is_finite()
-                        && 0.0 <= self.phase_inc
-                        && self.phase_inc < wave_len as f32,
-                    "Pitch out of RATE"
-                );
-                self.cur_len = (wave_len as f32 / self.phase_inc) as u32;
+                // And if this condition is false, then the pitch isn't in RATE at all.
+                let in_pitch = phase_inc.is_finite() && (0.0..wave_len as f32).contains(&phase_inc);
+                if in_pitch {
+                    self.phase_inc = phase_inc;
+                    self.cur_len = (wave_len as f32 / phase_inc) as u32;
+                }
             } else {
                 // no_std don't have builtin f32 functions.
-                self.phase_inc =
+                let phase_inc =
                     libm::exp2f((event.note as f32 + self.tuning as f32 / 1000.0 + 155.376) / 12.0)
                         / rate;
                 // This is needed for OrgInterpolation trait invariant.
-                // Valid org song with sufficiently high RATE should not fail this assert.
-                assert!(
-                    self.phase_inc.is_finite() && 0.0 <= self.phase_inc && self.phase_inc < 256.0,
-                    "Pitch out of RATE"
-                );
-                self.cur_len = if (self.pi_loop_calculated & 1) == 1 {
-                    (1024.0 / self.phase_inc) as u32
-                } else {
-                    (event.length as f32 * samples_per_beat) as u32
-                };
+                // And if this condition is false, then the pitch isn't in RATE at all.
+                let in_pitch = phase_inc.is_finite() && (0.0..256.0).contains(&phase_inc);
+                if in_pitch {
+                    self.phase_inc = phase_inc;
+                    self.cur_len = if (self.pi_loop_calculated & 1) == 1 {
+                        (1024.0 / phase_inc) as u32
+                    } else {
+                        (event.length as f32 * samples_per_beat) as u32
+                    };
+                }
             }
         }
     }
@@ -351,7 +350,7 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
         for i in 0..n {
             // Safety:
             // CaveStoryAssetProviderExt never return invalid length array.
-            // There is assert! macro in tick() method that ensures 0 <= phase_inc < len.
+            // There is check in tick() method that ensures 0 <= phase_inc < len.
             // And at the end of this for loop, pos is wrapped.
             let sample = unsafe {
                 debug_assert!(pos.is_finite() && 0.0 <= pos && pos < len as f32);
@@ -608,11 +607,9 @@ impl<I, A> OrgPlayBuilder<I, A> {
 
     /// # Panics
     ///
-    /// Panics if `rate` is less than 10000.
-    /// This is sanity check to prevent panic at synth methods.
+    /// Panics if `rate` is less than 1000.
     pub fn with_sample_rate(self, rate: u32) -> OrgPlayBuilder<I, A> {
-        // To prevent phase_inc assertions. The number is chosen arbitrarily.
-        assert!(rate >= 10000);
+        assert!(rate >= 1000);
         OrgPlayBuilder(self.0, self.1, rate)
     }
 
