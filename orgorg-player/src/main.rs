@@ -18,6 +18,7 @@ use cpal::{
     Device, SampleRate, StreamConfig,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
+use is_terminal::IsTerminal;
 use orgorg::{CaveStoryAssetProvider, OrgPlay, OrgPlayBuilder, interp_impls::Linear};
 
 use crate::pxt::synth_pxt;
@@ -41,6 +42,9 @@ struct Cli {
 
 #[derive(Args)]
 struct AudioConfig {
+    /// Output raw f32 audio data to stdout
+    #[arg(long)]
+    raw: bool,
     /// Mono output
     #[arg(long)]
     mono: bool,
@@ -74,6 +78,22 @@ fn find_config(device: &Device, config: &AudioConfig) -> Result<StreamConfig> {
     }
 
     anyhow::bail!("Cannot find suitable config")
+}
+
+fn player_raw(config: &AudioConfig, org: Vec<u8>, mut write: impl Write) -> Result<()> {
+    let mut player = OrgPlayBuilder::new()
+        .with_asset_provider(ASSET_BY_DUMP.get().unwrap())
+        .with_sample_rate(config.rate)
+        .build(&org);
+    let mut buf = [0.0_f32; 4096];
+    loop {
+        if config.mono {
+            player.synth_mono(&mut buf);
+        } else {
+            player.synth_stereo(&mut buf);
+        }
+        write.write_all(zerocopy::transmute_ref!(buf.as_slice()))?;
+    }
 }
 
 fn player(
@@ -220,15 +240,21 @@ fn main() -> Result<()> {
         Commands::Play { path, config } => {
             let org = std::fs::read(path).context("Cannot open .org file")?;
 
+            if config.raw {
+                let stdout = stdout().lock();
+                return player_raw(&config, org, stdout);
+            }
+
             let channels = if config.mono { 1 } else { 2 };
             let rate = config.rate;
+            let control: Arc<PlayerControl> = Arc::default();
+            let control_clone = control.clone();
+            let (_exit, exit_receiver) = oneshot::channel();
+
             let device = cpal::default_host()
                 .default_output_device()
                 .context("Cannot find audio output device")?;
             let config = find_config(&device, &config)?;
-            let control: Arc<PlayerControl> = Arc::default();
-            let control_clone = control.clone();
-            let (_exit, exit_receiver) = oneshot::channel();
 
             let join = std::thread::spawn(move || {
                 player(&device, config, org, control_clone, exit_receiver)
@@ -237,19 +263,22 @@ fn main() -> Result<()> {
             let mut stdout = stdout();
             let tick_rate = Duration::from_millis(50);
             loop {
-                let frames = control.played_samples.load(Ordering::Relaxed) / channels;
-                let secs = frames / rate as u64;
-                let milis = (frames % rate as u64) as f64 / rate as f64;
-                let milis = &format!("{milis:.2}")[2..];
-                stdout.write_all(
-                    format!(
-                        "{secs:>3}.{milis}s || Beat {}/{}              \r",
-                        control.cur_beat.load(Ordering::Relaxed),
-                        control.loop_end.load(Ordering::Relaxed)
-                    )
-                    .as_bytes(),
-                )?;
-                stdout.flush()?;
+                // Only print stat if it's terminal
+                if stdout.is_terminal() {
+                    let frames = control.played_samples.load(Ordering::Relaxed) / channels;
+                    let secs = frames / rate as u64;
+                    let milis = (frames % rate as u64) as f64 / rate as f64;
+                    let milis = &format!("{milis:.2}")[2..];
+                    stdout.write_all(
+                        format!(
+                            "{secs:>3}.{milis}s || Beat {}/{}              \r",
+                            control.cur_beat.load(Ordering::Relaxed),
+                            control.loop_end.load(Ordering::Relaxed)
+                        )
+                        .as_bytes(),
+                    )?;
+                    stdout.flush()?;
+                }
 
                 if join.is_finished() {
                     return join.join().unwrap();
