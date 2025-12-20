@@ -84,7 +84,8 @@ fn player_raw(config: &AudioConfig, org: Vec<u8>, mut write: impl Write) -> Resu
     let mut player = OrgPlayBuilder::new()
         .with_asset_provider(ASSET_BY_DUMP.get().unwrap())
         .with_sample_rate(config.rate)
-        .build(&org);
+        .build(&org)
+        .context("Invalid org music")?;
     let mut buf = [0.0_f32; 4096];
     loop {
         if config.mono {
@@ -118,16 +119,17 @@ fn player(
             dependent: DefaultOrgPlay,
         }
     );
-    let mut player = OwnedOrgPlay::new(org, |v| {
+    let mut player = OwnedOrgPlay::try_new(org, |v| -> Result<DefaultOrgPlay> {
         let player = OrgPlayBuilder::new()
             .with_asset_provider(ASSET_BY_DUMP.get().unwrap())
             .with_sample_rate(config.sample_rate.0)
-            .build(v);
+            .build(v)
+            .context("Invalid org music")?;
         let (loop_start, loop_end) = player.get_loop();
         control.loop_start.store(loop_start, Ordering::Relaxed);
         control.loop_end.store(loop_end, Ordering::Relaxed);
-        player
-    });
+        Ok(player)
+    })?;
 
     let ctrl = control.clone();
     let stream = device.build_output_stream(
