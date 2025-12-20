@@ -386,8 +386,6 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
 /// `no_std` compatible Cave Story Organya Music Player.
 ///
 /// Based on bisqwit's C++ OrgPlay.
-///
-/// **Can panic anytime if song is invalid.**
 pub struct OrgPlay<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> {
     // I want to make this integer, but then RATE must be multiple of 1000.
     sample_rate: u32,
@@ -636,7 +634,10 @@ where
     I: OrgInterpolation,
     A: CaveStoryAssetProvider,
 {
-    // TODO: Write a validator
+    /// # Panics
+    ///
+    /// Panics if song is invalid.
+    // TODO:Don't panic, return Result.
     pub fn build<'a>(self, song: &'a [u8]) -> OrgPlay<'a, I, A> {
         OrgPlay::<I, A>::new(self.1, song, self.2)
     }
