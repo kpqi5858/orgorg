@@ -83,7 +83,8 @@ fn criterion_benchmark(c: &mut Criterion) {
                     (
                         OrgPlayBuilder::new()
                             .with_asset_provider(ConstAsset)
-                            .build(data),
+                            .build(data)
+                            .unwrap(),
                         vec![0.0_f32; 4096],
                     )
                 },
