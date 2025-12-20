@@ -10,7 +10,7 @@
 //!
 //! This crate uses some unsafe in critical areas to boost the performance. I tried to ensure correctness but, who knows.
 
-use core::{cmp, marker::PhantomData, ptr::NonNull};
+use core::{cmp, marker::PhantomData, mem::MaybeUninit, ptr::NonNull};
 
 const MASTER_VOLUME: f32 = 0.25 / 65536.0;
 const DRUM_LEN: [usize; 6] = [5000, 10000, 10000, 1000, 10000, 4000];
@@ -188,7 +188,7 @@ struct Event {
 struct Instrument<'a, I: OrgInterpolation, const DRUM: bool> {
     // Must be:
     // - If n_events is 0, this pointer can be dangling so never access it
-    // - else, this is a start of slice with length of n_events * 8
+    // - else, this is a start of &'a [u8] with length of n_events * 8
     inst_data_ptr: NonNull<u8>,
     tuning: i16,
     // loop_event: Option<i16> is ergonomic but this saves space
@@ -400,9 +400,14 @@ pub struct OrgPlay<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> {
 }
 
 impl<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> OrgPlay<'a, I, A> {
-    fn new(asset: A, song: &'a [u8], rate: u32) -> Self {
-        assert_eq!(&song[0..6], b"Org-02", "Header mismatch");
-        let ms_per_beat = song.read_i16(6);
+    fn new(asset: A, song: &'a [u8], rate: u32) -> Option<Self> {
+        if song.get(0..6) != Some(b"Org-02") {
+            return None;
+        }
+        if song.len() < 114 {
+            return None;
+        }
+        let ms_per_beat = song.read_u16(6);
         let samples_per_beat = ms_per_beat as f32 * (rate as f32 / 1000.0);
         let loop_start = song.read_u32(10);
         let loop_end = song.read_u32(14);
@@ -410,15 +415,20 @@ impl<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> OrgPlay<'a, I, A> {
         let mut offset = 18;
         let mut ins_data_offset = 114;
         let tick_args = &(0, loop_start, samples_per_beat, rate);
-        let wave_ins = core::array::from_fn(|_| {
+
+        // core::array really needs try_from_fn
+        let mut wave_ins = core::array::from_fn(|_| MaybeUninit::uninit());
+        for val in &mut wave_ins {
             let wave = song.read_i8(offset + 2);
             let valid_wave = (0..100).contains(&wave);
+
             let n_events = song.read_u16(offset + 4);
             let pi = if song.read_i8(offset + 3) != 0 { 1 } else { 0 };
             let inst_data_ptr = if n_events == 0 {
                 NonNull::dangling()
             } else {
-                let inst_data = &song[ins_data_offset..ins_data_offset + n_events as usize * 8];
+                let inst_data =
+                    song.get(ins_data_offset..ins_data_offset + n_events as usize * 8)?;
                 // Safety: slice is always valid, and bound checked
                 unsafe { NonNull::new_unchecked(inst_data.as_ptr() as *mut u8) }
             };
@@ -441,19 +451,24 @@ impl<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> OrgPlay<'a, I, A> {
             // Initial ticking for beat 0, since synth function will start ticking at beat 1
             ret.tick(tick_args);
             offset += 6;
-            ins_data_offset += 8 * ret.n_events as usize;
-            ret
-        });
-        let drum_ins = core::array::from_fn(|_| {
+            ins_data_offset += n_events as usize * 8;
+            val.write(ret);
+        }
+        let mut drum_ins = core::array::from_fn(|_| MaybeUninit::uninit());
+        for val in &mut drum_ins {
             // -1 means there is no corresponding drum effect.
-            let wave =
-                [0, -1, 1, -1, 2, 3, 4, -1, 5, -1, -1, -1][song.read_i8(offset + 2) as usize];
+            const DRUM_MAPPING: [i8; 12] = [0, -1, 1, -1, 2, 3, 4, -1, 5, -1, -1, -1];
+            let wave = *DRUM_MAPPING
+                .get(song.read_i8(offset + 2) as usize)
+                .unwrap_or(&-1);
+
             let n_events = song.read_u16(offset + 4);
             let pi = if song.read_i8(offset + 3) != 0 { 1 } else { 0 };
             let inst_data_ptr = if n_events == 0 {
                 NonNull::dangling()
             } else {
-                let inst_data = &song[ins_data_offset..ins_data_offset + n_events as usize * 8];
+                let inst_data =
+                    song.get(ins_data_offset..ins_data_offset + n_events as usize * 8)?;
                 // Safety: slice is always valid, and bound checked
                 unsafe { NonNull::new_unchecked(inst_data.as_ptr() as *mut u8) }
             };
@@ -461,7 +476,6 @@ impl<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> OrgPlay<'a, I, A> {
                 inst_data_ptr,
                 tuning: song.read_i16(offset),
                 pi_loop_calculated: pi,
-                // And it won't produce a sound.
                 n_events: if wave == -1 { 0 } else { n_events }, // Must be 0 for invalid wave
                 phase_inc: 0.0,
                 phase_acc: 0.0,
@@ -477,20 +491,32 @@ impl<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> OrgPlay<'a, I, A> {
             // Initial ticking for beat 0, since synth function will start ticking at beat 1
             ret.tick(tick_args);
             offset += 6;
-            ins_data_offset += 8 * n_events as usize;
-            ret
-        });
-        Self {
+            ins_data_offset += n_events as usize * 8;
+            val.write(ret);
+        }
+        debug_assert!(offset == 114);
+        Some(Self {
             sample_rate: rate,
             samples_per_beat,
             remaining_samples: samples_per_beat,
             loop_start,
             loop_end,
             cur_beat: 0,
-            wave_ins,
-            drum_ins,
+            // Safety: They are all initialized now
+            wave_ins: unsafe {
+                core::mem::transmute::<
+                    [MaybeUninit<Instrument<'a, I, false>>; 8],
+                    [Instrument<'a, I, false>; 8],
+                >(wave_ins)
+            },
+            drum_ins: unsafe {
+                core::mem::transmute::<
+                    [MaybeUninit<Instrument<'a, I, true>>; 8],
+                    [Instrument<'a, I, true>; 8],
+                >(drum_ins)
+            },
             asset,
-        }
+        })
     }
 
     /// Generates 1-channel mono audio data.
@@ -634,11 +660,8 @@ where
     I: OrgInterpolation,
     A: CaveStoryAssetProvider,
 {
-    /// # Panics
-    ///
-    /// Panics if song is invalid.
-    // TODO:Don't panic, return Result.
-    pub fn build<'a>(self, song: &'a [u8]) -> OrgPlay<'a, I, A> {
+    /// Returns None if song is invalid.
+    pub fn build<'a>(self, song: &'a [u8]) -> Option<OrgPlay<'a, I, A>> {
         OrgPlay::<I, A>::new(self.1, song, self.2)
     }
 }
