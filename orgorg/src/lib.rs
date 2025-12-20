@@ -75,17 +75,17 @@ pub trait CaveStoryAssetProvider {
 
 // Internal helper methods.
 trait CaveStoryAssetProviderExt {
-    fn get_wavetable(&self, idx: i8) -> &[i8; 256];
+    unsafe fn get_wavetable(&self, idx: i8) -> &[i8; 256];
     // MUST NOT return empty array.
-    fn get_drum(&self, idx: i8) -> &[i8];
+    unsafe fn get_drum(&self, idx: i8) -> &[i8];
 }
 
 impl<T: CaveStoryAssetProvider> CaveStoryAssetProviderExt for T {
+    // Safety: 0 <= idx < 100
     #[inline(always)]
-    fn get_wavetable(&self, idx: i8) -> &[i8; 256] {
-        assert!((0..100).contains(&idx));
+    unsafe fn get_wavetable(&self, idx: i8) -> &[i8; 256] {
+        debug_assert!((0..100).contains(&idx));
         let idx = idx as usize * 256;
-        // Safety: Checked bound with assert!.
         unsafe {
             let w: &[u8; 256] = self
                 .wavetable()
@@ -96,15 +96,15 @@ impl<T: CaveStoryAssetProvider> CaveStoryAssetProviderExt for T {
         }
     }
 
+    // Safety: 0 <= idx < 6
     #[inline(always)]
-    fn get_drum(&self, idx: i8) -> &[i8] {
-        assert!((0..6).contains(&idx));
+    unsafe fn get_drum(&self, idx: i8) -> &[i8] {
+        debug_assert!((0..6).contains(&idx));
         let idx = idx as usize;
-        // Safety: Checked bound with assert!.
         unsafe {
-            let w = self
-                .drum()
-                .get_unchecked(DRUM_OFFSET[idx]..DRUM_OFFSET[idx + 1]);
+            let start = *DRUM_OFFSET.get_unchecked(idx);
+            let end = *DRUM_OFFSET.get_unchecked(idx + 1);
+            let w = self.drum().get_unchecked(start..end);
             bytemuck::must_cast_slice(w)
         }
     }
@@ -204,6 +204,7 @@ struct Instrument<'a, I: OrgInterpolation, const DRUM: bool> {
     phase_acc: f32,
     cur_pan: u8,
     cur_vol: u8,
+    // if n_events != 0, must point to valid wave
     wave_idx: i8,
     cur_len: u32,
     _i: PhantomData<I>,
@@ -326,10 +327,13 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
         if self.cur_len == 0 {
             return;
         }
-        let cur_wave = if DRUM {
-            a.get_drum(self.wave_idx)
-        } else {
-            a.get_wavetable(self.wave_idx)
+        // Safety: See wave_idx field comment
+        let cur_wave = unsafe {
+            if DRUM {
+                a.get_drum(self.wave_idx)
+            } else {
+                a.get_wavetable(self.wave_idx)
+            }
         };
         let len = cur_wave.len();
         // Safety: CaveStoryAssetProviderExt never return empty array.
@@ -410,6 +414,7 @@ impl<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> OrgPlay<'a, I, A> {
         let tick_args = &(0, loop_start, samples_per_beat, rate);
         let wave_ins = core::array::from_fn(|_| {
             let wave = song.read_i8(offset + 2);
+            let valid_wave = (0..100).contains(&wave);
             let n_events = song.read_u16(offset + 4);
             let pi = if song.read_i8(offset + 3) != 0 { 1 } else { 0 };
             let inst_data_ptr = if n_events == 0 {
@@ -423,7 +428,7 @@ impl<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> OrgPlay<'a, I, A> {
                 inst_data_ptr,
                 tuning: song.read_i16(offset),
                 pi_loop_calculated: pi,
-                n_events,
+                n_events: if valid_wave { n_events } else { 0 }, // Must be 0 for invalid wave
                 phase_inc: 0.0,
                 phase_acc: 0.0,
                 cur_pan: 0,
@@ -459,7 +464,7 @@ impl<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> OrgPlay<'a, I, A> {
                 tuning: song.read_i16(offset),
                 pi_loop_calculated: pi,
                 // And it won't produce a sound.
-                n_events: if wave == -1 { 0 } else { n_events },
+                n_events: if wave == -1 { 0 } else { n_events }, // Must be 0 for invalid wave
                 phase_inc: 0.0,
                 phase_acc: 0.0,
                 cur_pan: 0,
