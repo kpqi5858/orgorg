@@ -13,13 +13,14 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use cpal::{
     Device, SampleRate, StreamConfig,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
 use is_terminal::IsTerminal;
-use orgorg::{CaveStoryAssetProvider, OrgPlay, OrgPlayBuilder, interp_impls::Linear};
+use orgorg::{CaveStoryAssetProvider, OrgInterpolation, OrgPlay, OrgPlayBuilder};
+use ouroboros::self_referencing;
 
 use crate::pxt::synth_pxt;
 
@@ -51,6 +52,9 @@ struct AudioConfig {
     /// Sample rate
     #[arg(long, default_value = "48000")]
     rate: u32,
+    /// Interpolation to use
+    #[arg(long, value_enum, default_value = "linear")]
+    interp: InterpModes,
 }
 
 #[derive(Subcommand)]
@@ -63,6 +67,73 @@ enum Commands {
         #[command(flatten)]
         config: AudioConfig,
     },
+}
+
+#[derive(ValueEnum, Clone, Copy)]
+enum InterpModes {
+    Linear,
+    None,
+    Lanczos,
+}
+
+// Bad API design lol. Requires user to do this shit.
+// Well, self-referential struct isn't that bad.
+// But compile-time generics -> runtime polymorphism is painful.
+#[self_referencing]
+struct OwnedOrgPlay<I: OrgInterpolation, A: CaveStoryAssetProvider> {
+    org: Vec<u8>,
+    #[borrows(org)]
+    #[covariant]
+    player: OrgPlay<'this, I, A>,
+}
+
+trait DynOrgPlay: Send {
+    fn synth_mono(&mut self, buf: &mut [f32]);
+    fn synth_stereo(&mut self, buf: &mut [f32]);
+    fn get_loop(&self) -> (u32, u32);
+    fn get_beat(&self) -> u32;
+}
+
+impl<I: OrgInterpolation, A: CaveStoryAssetProvider + Send> DynOrgPlay for OwnedOrgPlay<I, A> {
+    fn synth_mono(&mut self, buf: &mut [f32]) {
+        self.with_player_mut(|player| player.synth_mono(buf));
+    }
+    fn synth_stereo(&mut self, buf: &mut [f32]) {
+        self.with_player_mut(|player| player.synth_stereo(buf));
+    }
+    fn get_loop(&self) -> (u32, u32) {
+        self.with_player(|player| player.get_loop())
+    }
+    fn get_beat(&self) -> u32 {
+        self.with_player(|player| player.get_beat())
+    }
+}
+
+fn make_dyn_orgplay(
+    org: Vec<u8>,
+    interp: InterpModes,
+    sample_rate: u32,
+) -> Result<Box<dyn DynOrgPlay>> {
+    use orgorg::interp_impls;
+    // At least we can use macro here.
+    macro_rules! make {
+        ($t:tt) => {
+            Box::new(OwnedOrgPlay::try_new(org, |o| {
+                OrgPlayBuilder::new()
+                    .with_sample_rate(sample_rate)
+                    .with_asset_provider(ASSET_BY_DUMP.get().unwrap())
+                    .with_interpolation(interp_impls::$t)
+                    .build(o)
+                    .context("Invalid org music")
+            })?)
+        };
+    }
+    let res: Box<dyn DynOrgPlay> = match interp {
+        InterpModes::Linear => make!(Linear),
+        InterpModes::None => make!(NoInterp),
+        InterpModes::Lanczos => make!(Lanczos),
+    };
+    Ok(res)
 }
 
 fn find_config(device: &Device, config: &AudioConfig) -> Result<StreamConfig> {
@@ -81,11 +152,7 @@ fn find_config(device: &Device, config: &AudioConfig) -> Result<StreamConfig> {
 }
 
 fn player_raw(config: &AudioConfig, org: Vec<u8>, mut write: impl Write) -> Result<()> {
-    let mut player = OrgPlayBuilder::new()
-        .with_asset_provider(ASSET_BY_DUMP.get().unwrap())
-        .with_sample_rate(config.rate)
-        .build(&org)
-        .context("Invalid org music")?;
+    let mut player = make_dyn_orgplay(org, config.interp, config.rate)?;
     let mut buf = [0.0_f32; 4096];
     loop {
         if config.mono {
@@ -100,36 +167,17 @@ fn player_raw(config: &AudioConfig, org: Vec<u8>, mut write: impl Write) -> Resu
 fn player(
     device: &Device,
     config: StreamConfig,
+    interp: InterpModes,
     org: Vec<u8>,
     control: Arc<PlayerControl>,
     exit: oneshot::Receiver<()>,
 ) -> Result<()> {
     let channels = config.channels;
 
-    // Here I ran into classic Rust pitfall!
-    // I want to send OrgPlayer to cpal thread and there is just no way of doing it.
-    // Vec::leak(org) is rough solution but will cause memory leak,
-    // Keeping the player and sending synthesized audio data by ringbuf is a valid solution.
-    // But probably the simplest answer is a crate that lets you use self-referential struct safely.
-    type DefaultOrgPlay<'a> = OrgPlay<'a, Linear, &'static AssetByDump>;
-    self_cell::self_cell!(
-        struct OwnedOrgPlay {
-            owner: Vec<u8>,
-            #[covariant]
-            dependent: DefaultOrgPlay,
-        }
-    );
-    let mut player = OwnedOrgPlay::try_new(org, |v| -> Result<DefaultOrgPlay> {
-        let player = OrgPlayBuilder::new()
-            .with_asset_provider(ASSET_BY_DUMP.get().unwrap())
-            .with_sample_rate(config.sample_rate.0)
-            .build(v)
-            .context("Invalid org music")?;
-        let (loop_start, loop_end) = player.get_loop();
-        control.loop_start.store(loop_start, Ordering::Relaxed);
-        control.loop_end.store(loop_end, Ordering::Relaxed);
-        Ok(player)
-    })?;
+    let mut player = make_dyn_orgplay(org, interp, config.sample_rate.0)?;
+    let (loop_start, loop_end) = player.get_loop();
+    control.loop_start.store(loop_start, Ordering::Relaxed);
+    control.loop_end.store(loop_end, Ordering::Relaxed);
 
     let ctrl = control.clone();
     let stream = device.build_output_stream(
@@ -138,16 +186,16 @@ fn player(
             if ctrl.paused.load(Ordering::Relaxed) {
                 return;
             }
-            player.with_dependent_mut(|_, player| {
-                match channels {
-                    1 => player.synth_mono(data),
-                    2 => player.synth_stereo(data),
-                    _ => (),
-                }
-                ctrl.played_samples
-                    .fetch_add(data.len() as u64, Ordering::Relaxed);
-                ctrl.cur_beat.store(player.get_beat(), Ordering::Relaxed);
-            });
+            // Usually synthesis inside audio thread is bad idea.
+            // But my player is very fast so not big of deal.
+            match channels {
+                1 => player.synth_mono(data),
+                2 => player.synth_stereo(data),
+                _ => (),
+            }
+            ctrl.played_samples
+                .fetch_add(data.len() as u64, Ordering::Relaxed);
+            ctrl.cur_beat.store(player.get_beat(), Ordering::Relaxed);
         },
         |err| {
             eprintln!("{err}");
@@ -247,6 +295,7 @@ fn main() -> Result<()> {
                 return player_raw(&config, org, stdout);
             }
 
+            let interp = config.interp;
             let channels = if config.mono { 1 } else { 2 };
             let rate = config.rate;
             let control: Arc<PlayerControl> = Arc::default();
@@ -259,7 +308,7 @@ fn main() -> Result<()> {
             let config = find_config(&device, &config)?;
 
             let join = std::thread::spawn(move || {
-                player(&device, config, org, control_clone, exit_receiver)
+                player(&device, config, interp, org, control_clone, exit_receiver)
             });
 
             let mut stdout = stdout();
