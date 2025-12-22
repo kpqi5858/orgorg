@@ -144,6 +144,7 @@ pub mod interp_impls {
     pub struct Linear;
 
     impl OrgInterpolation for Linear {
+        // This function is carefully written with profiling and Compiler Explorer in Rust 1.92
         #[inline(always)]
         unsafe fn interpolate(wave: &[i8], pos: f32) -> f32 {
             let len = wave.len();
@@ -153,6 +154,8 @@ pub mod interp_impls {
                 // `pos - libm::truncf(pos)` is 20% slower.
                 // f32::to_int_unchecked is another significant speedup.
                 let pos_i = pos.to_int_unchecked::<i32>();
+                // Saves one instruction in aarch64.
+                core::hint::assert_unchecked(pos_i >= 0);
                 let frac = pos - (pos_i as f32);
                 // pos.to_int_unchecked::<usize>() is slower than this cast.
                 let pos_idx = pos_i as usize;
@@ -221,6 +224,7 @@ pub mod interp_impls {
             unsafe {
                 let len = wave.len();
                 let pos_i = pos.to_int_unchecked::<i32>();
+                core::hint::assert_unchecked(pos_i >= 0);
                 let frac = pos - (pos_i as f32);
                 let pos = pos_i as usize;
                 let s1 = *wave.get_unchecked(if pos == 0 { len - 1 } else { pos - 1 }) as f32;
