@@ -456,8 +456,11 @@ impl<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> OrgPlay<'a, I, A> {
         let mut ins_data_offset = 114;
         let tick_args = &(0, loop_start, samples_per_beat, rate);
 
-        // core::array really needs try_from_fn
-        let mut wave_ins = core::array::from_fn(|_| MaybeUninit::uninit());
+        // core::array really needs try_from_fn, or array::try_map
+        // Instrument does not allocate anything so no risk of memory leak when early returns.
+        let mut wave_ins = [const { MaybeUninit::uninit() }; 8];
+        let mut drum_ins = [const { MaybeUninit::uninit() }; 8];
+
         for val in &mut wave_ins {
             let wave = song.read_i8(offset + 2);
             let valid_wave = (0..100).contains(&wave);
@@ -494,7 +497,6 @@ impl<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> OrgPlay<'a, I, A> {
             ins_data_offset += n_events as usize * 8;
             val.write(ret);
         }
-        let mut drum_ins = core::array::from_fn(|_| MaybeUninit::uninit());
         for val in &mut drum_ins {
             // -1 means there is no corresponding drum effect.
             const DRUM_MAPPING: [i8; 12] = [0, -1, 1, -1, 2, 3, 4, -1, 5, -1, -1, -1];
@@ -534,7 +536,12 @@ impl<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> OrgPlay<'a, I, A> {
             ins_data_offset += n_events as usize * 8;
             val.write(ret);
         }
-        debug_assert!(offset == 114);
+
+        // More data after song? Reject.
+        if ins_data_offset != song.len() {
+            return None;
+        }
+
         Some(Self {
             sample_rate: rate,
             samples_per_beat,
@@ -542,7 +549,7 @@ impl<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> OrgPlay<'a, I, A> {
             loop_start,
             loop_end,
             cur_beat: 0,
-            // Safety: They are all initialized now
+            // Safety: They are all initialized now.
             wave_ins: unsafe {
                 core::mem::transmute::<
                     [MaybeUninit<Instrument<'a, I, false>>; 8],
@@ -650,6 +657,7 @@ impl<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> OrgPlay<'a, I, A> {
         self.cur_beat
     }
 
+    // TODO: Play till function
     // TODO: Seek function (Will be expensive)
 }
 
