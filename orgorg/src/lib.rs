@@ -130,7 +130,7 @@ pub trait OrgInterpolation {
     /// Interpolate the `wave` from `pos`. **This function is called at audio rate**.
     /// # Safety
     /// Caller must guarantee that
-    /// - `wave` is 256-length wavetable or non-empty maximum 10000-length drum sample,
+    /// - `wave` is 256-length wavetable or [1000, 10000] length pxt sample,
     /// - `pos` is finite value and `0.0 <= pos < wave.len() as f32`.
     ///
     /// These strict requirements can enable more performant code, like [`f32::to_int_unchecked()`].
@@ -154,12 +154,13 @@ pub mod interp_impls {
                 // f32::to_int_unchecked is another significant speedup.
                 let pos_i = pos.to_int_unchecked::<i32>();
                 let frac = pos - (pos_i as f32);
+                // pos.to_int_unchecked::<usize>() is slower than this cast.
                 let pos_idx = pos_i as usize;
                 let sample1 = *wave.get_unchecked(pos_idx);
-                let sample2 = *wave.get_unchecked((pos_idx.unchecked_add(1)) % len);
+                let sample2 = *wave.get_unchecked((pos_idx + 1) % len);
                 // The "imprecise" lerp (see Wikipedia Linear Interpolation).
                 // Monotonic, and slightly fast over "precise" one.
-                sample1 as f32 + ((sample2 as i32).unchecked_sub(sample1 as i32)) as f32 * frac
+                sample1 as f32 + ((sample2 as i32) - (sample1 as i32)) as f32 * frac
             }
         }
     }
@@ -175,7 +176,7 @@ pub mod interp_impls {
         }
     }
 
-    /// Lanczos Interpolation. Very Slow.
+    /// Lanczos Interpolation. Extremely Slow.
     pub struct Lanczos;
 
     impl OrgInterpolation for Lanczos {
@@ -210,7 +211,41 @@ pub mod interp_impls {
         }
     }
 
-    // TODO: Lagrange Interpolation
+    /// Lagrange Interpolation. Slow.
+    pub struct Lagrange;
+
+    impl OrgInterpolation for Lagrange {
+        #[inline(always)]
+        unsafe fn interpolate(wave: &[i8], pos: f32) -> f32 {
+            // Safety: Caller guarantees that pos is finite, and 0 <= pos < wave.len().
+            unsafe {
+                let len = wave.len();
+                let pos_i = pos.to_int_unchecked::<i32>();
+                let frac = pos - (pos_i as f32);
+                let pos = pos_i as usize;
+                let s1 = *wave.get_unchecked(if pos == 0 { len - 1 } else { pos - 1 }) as f32;
+                let s2 = *wave.get_unchecked(pos) as f32;
+                let s3 = *wave.get_unchecked((pos + 1) % len) as f32;
+                // Compiler should optimize this branchless, which is faster than (pos + 2) % idx.
+                // (pos + 1) % len is already branchless.
+                let s4_idx = if pos + 2 == len + 1 {
+                    1
+                } else if pos + 2 == len {
+                    0
+                } else {
+                    pos + 2
+                };
+                let s4 = *wave.get_unchecked(s4_idx) as f32;
+
+                let c0 = s2;
+                let c1 = s3 - s1 / 3.0 - s2 / 2.0 - s4 / 6.0;
+                let c2 = (s1 + s3) / 2.0 - s2;
+                let c3 = (s4 - s1) / 6.0 + (s2 - s3) / 2.0;
+
+                ((c3 * frac + c2) * frac + c1) * frac + c0
+            }
+        }
+    }
 }
 
 struct Event {
