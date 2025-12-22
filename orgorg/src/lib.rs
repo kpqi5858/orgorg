@@ -216,6 +216,7 @@ unsafe impl<'a, I: OrgInterpolation, const DRUM: bool> Sync for Instrument<'a, I
 
 impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
     // Safety: cur_event < n_events
+    #[inline]
     unsafe fn get_cur_event_beat(&self) -> u32 {
         debug_assert!(self.cur_event < self.n_events);
         // Safety: See inst_data_ptr field comment
@@ -228,6 +229,7 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
     }
 
     // Safety: cur_event < n_events
+    #[inline]
     unsafe fn get_cur_event(&self) -> Event {
         debug_assert!(self.cur_event < self.n_events);
         // Safety: See inst_data_ptr field comment
@@ -287,12 +289,13 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
             self.cur_pan = (left << 4) | right;
         }
         if event.note != 255 {
-            self.cur_len = 0;
             self.phase_acc = 0.0;
+            self.cur_len = 0;
             let rate = *rate as f32;
             if DRUM {
-                let wave_len = DRUM_LEN[self.wave_idx as usize];
-                let phase_inc = event.note as f32 * (22050.0 / 32.5) / rate;
+                // Safety: See wave_idx field comment
+                let wave_len = unsafe { *DRUM_LEN.get_unchecked(self.wave_idx as usize) };
+                let phase_inc = (event.note as i32 * 800 + 100) as f32 / rate;
                 // This is needed for OrgInterpolation trait invariant.
                 // And if this condition is false, then the pitch isn't in RATE at all.
                 let in_pitch = phase_inc.is_finite() && (0.0..wave_len as f32).contains(&phase_inc);
@@ -301,10 +304,12 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
                     self.cur_len = (wave_len as f32 / phase_inc) as u32;
                 }
             } else {
-                // no_std don't have builtin f32 functions.
-                let phase_inc =
-                    libm::exp2f((event.note as f32 + self.tuning as f32 / 1000.0 + 155.376) / 12.0)
-                        / rate;
+                const FRQ_TABLE: [i32; 12] =
+                    [262, 277, 294, 311, 330, 349, 370, 392, 415, 440, 466, 494];
+                let freq = FRQ_TABLE[(event.note % 12) as usize];
+                let oct = 1 << (5 + (event.note / 12).min(7) as i32);
+                let final_freq = (freq * oct) + (self.tuning as i32 - 1000);
+                let phase_inc = final_freq as f32 / rate;
                 // This is needed for OrgInterpolation trait invariant.
                 // And if this condition is false, then the pitch isn't in RATE at all.
                 let in_pitch = phase_inc.is_finite() && (0.0..256.0).contains(&phase_inc);
