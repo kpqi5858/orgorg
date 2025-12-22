@@ -53,7 +53,7 @@ struct AudioConfig {
     #[arg(long, default_value = "48000")]
     rate: u32,
     /// Interpolation to use
-    #[arg(long, value_enum, default_value = "linear")]
+    #[arg(long, value_enum, default_value = "lagrange")]
     interp: InterpModes,
 }
 
@@ -74,6 +74,7 @@ enum InterpModes {
     Linear,
     None,
     Lanczos,
+    Lagrange,
 }
 
 // Bad API design lol. Requires user to do this shit.
@@ -132,6 +133,7 @@ fn make_dyn_orgplay(
         InterpModes::Linear => make!(Linear),
         InterpModes::None => make!(NoInterp),
         InterpModes::Lanczos => make!(Lanczos),
+        InterpModes::Lagrange => make!(Lagrange),
     };
     Ok(res)
 }
