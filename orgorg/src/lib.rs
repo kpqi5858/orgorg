@@ -140,7 +140,7 @@ pub trait OrgInterpolation {
 /// Builtin [`OrgInterpolation`] implementations.
 pub mod interp_impls {
     use super::OrgInterpolation;
-    /// Linear Interpolation.
+    /// Linear Interpolation. Fast.
     pub struct Linear;
 
     impl OrgInterpolation for Linear {
@@ -164,7 +164,7 @@ pub mod interp_impls {
         }
     }
 
-    /// No Interpolation.
+    /// No Interpolation. Fastest.
     pub struct NoInterp;
 
     impl OrgInterpolation for NoInterp {
@@ -175,7 +175,42 @@ pub mod interp_impls {
         }
     }
 
-    // TODO: Lanczos, Lagrange Interpolation
+    /// Lanczos Interpolation. Very Slow.
+    pub struct Lanczos;
+
+    impl OrgInterpolation for Lanczos {
+        unsafe fn interpolate(wave: &[i8], pos: f32) -> f32 {
+            use core::f32::consts::PI;
+            const KERNEL_SIZE: i32 = 2;
+            const KERNEL_SIZE_F: f32 = KERNEL_SIZE as f32;
+            fn sinc(x: f32) -> f32 {
+                if x == 0.0 {
+                    1.0
+                } else {
+                    libm::sinf(PI * x) / (PI * x)
+                }
+            }
+            fn l(x: f32) -> f32 {
+                if x.abs() < KERNEL_SIZE_F {
+                    sinc(x) * sinc(x / KERNEL_SIZE_F)
+                } else {
+                    0.0
+                }
+            }
+            let mut res = 0.0;
+            let mut weights = 0.0;
+            let x_floor: i32 = pos as i32;
+            for i in (x_floor - KERNEL_SIZE + 1)..=(x_floor + KERNEL_SIZE) {
+                let val = wave[i.rem_euclid(wave.len() as i32) as usize];
+                let weight = l(pos - i as f32);
+                res += val as f32 * weight;
+                weights += weight;
+            }
+            if weights == 0.0 { 0.0 } else { res / weights }
+        }
+    }
+
+    // TODO: Lagrange Interpolation
 }
 
 struct Event {
