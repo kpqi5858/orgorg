@@ -322,13 +322,11 @@ fn main() -> Result<()> {
                     let secs = frames / rate as u64;
                     let milis = (frames % rate as u64) as f64 / rate as f64;
                     let milis = &format!("{milis:.2}")[2..];
-                    stdout.write_all(
-                        format!(
-                            "{secs:>3}.{milis}s || Beat {}/{}              \r",
-                            control.cur_beat.load(Ordering::Relaxed),
-                            control.loop_end.load(Ordering::Relaxed)
-                        )
-                        .as_bytes(),
+                    write!(
+                        stdout,
+                        "\x1b[2K{secs:>3}.{milis}s || Beat {}/{}\r",
+                        control.cur_beat.load(Ordering::Relaxed),
+                        control.loop_end.load(Ordering::Relaxed)
                     )?;
                     stdout.flush()?;
                 }
