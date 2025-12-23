@@ -2,13 +2,43 @@
 
 //! `no_std` compatible Cave Story Organya Music Player.
 //!
+//! Partially based on bisqwit's C++ OrgPlay.
+//!
+//! # Example
+//! ```no_run
+//! use orgorg::{OrgPlay, OrgPlayBuilder, AssetByRef, interp_impls::Linear};
+//!
+//! let wavetable: &[u8; 25600] = todo!();
+//! let drum: &[u8; 40000] = todo!();
+//! let org: &[u8] = todo!();
+//!
+//! let mut player: OrgPlay<'_, Linear, AssetByRef<'_>> = OrgPlayBuilder::new()
+//!     .with_sample_rate(44100)
+//!     .with_interpolation(Linear)
+//!     .with_asset(wavetable, drum) // Lifetime of them is now tied to AssetByRef<'_>
+//!     .build(org) // Lifetime of `org` is now tied to OrgPlay<'_, ..>
+//!     .expect("Invalid organya music");
+//!
+//! let mut buffer = [0.0_f32; 1024];
+//! loop {
+//!     player.synth_stereo(&mut buffer);
+//!     // Do stuffs with buffer
+//! }
+//! ```
+//!
+//! For owned [`OrgPlay`], use self-referential struct helpers like
+//! [`self_cell`](https://crates.io/crates/self_cell) or [`ouroboros`](https://crates.io/crates/ouroboros).
+//! See orgorg-player for example.
+//!
 //! # How to get data needed for synthesis
 //! See orgorg-player project. Run `orgorg-player dump`.
 //!
 //! # Performance
-//! FPU should be present for maximum performance, since there are lots of floating point arithmetics.
+//! FPU should be present for maximum performance,
+//! since there are lots of single-precision(f32) floating point arithmetic.
 //!
-//! This crate uses some unsafe in critical areas to boost the performance. I tried to ensure correctness but, who knows.
+//! This crate uses some unsafe to boost the performance.
+//! The author tried to ensure correctness but, who knows.
 
 use core::{cmp, marker::PhantomData, mem::MaybeUninit, ptr::NonNull};
 
@@ -51,7 +81,7 @@ impl U8SliceExt for [u8] {
 ///
 /// But if you want zero-sized provider, use this snippet in your code.
 /// Keep in mind that this will embed Cave Story data in your binary - You can NOT redistribute.
-/// ```
+/// ```ignore
 /// struct ConstAsset;
 ///
 /// impl CaveStoryAssetProvider for ConstAsset {
@@ -110,10 +140,10 @@ impl<T: CaveStoryAssetProvider> CaveStoryAssetProviderExt for T {
     }
 }
 
-#[doc(hidden)]
-pub struct AssetByData<'a>(&'a [u8; 25600], &'a [u8; 40000]);
+/// Default provider used in [`OrgPlayBuilder::with_asset`]
+pub struct AssetByRef<'a>(&'a [u8; 25600], &'a [u8; 40000]);
 
-impl CaveStoryAssetProvider for AssetByData<'_> {
+impl CaveStoryAssetProvider for AssetByRef<'_> {
     #[inline(always)]
     fn wavetable(&self) -> &[u8; 25600] {
         self.0
@@ -463,8 +493,6 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
 }
 
 /// `no_std` compatible Cave Story Organya Music Player.
-///
-/// Based on bisqwit's C++ OrgPlay.
 pub struct OrgPlay<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> {
     // I want to make this integer, but then RATE must be multiple of 1000.
     sample_rate: u32,
@@ -737,8 +765,8 @@ impl<I, A> OrgPlayBuilder<I, A> {
         self,
         wavetable: &'a [u8; 25600],
         drum: &'a [u8; 40000],
-    ) -> OrgPlayBuilder<I, AssetByData<'a>> {
-        self.with_asset_provider(AssetByData(wavetable, drum))
+    ) -> OrgPlayBuilder<I, AssetByRef<'a>> {
+        self.with_asset_provider(AssetByRef(wavetable, drum))
     }
 }
 
