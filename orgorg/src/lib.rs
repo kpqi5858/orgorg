@@ -508,13 +508,16 @@ pub struct OrgPlay<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> {
 
 impl<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> OrgPlay<'a, I, A> {
     fn new(asset: A, song: &'a [u8], rate: u32) -> Option<Self> {
-        if song.get(0..6) != Some(b"Org-02") {
-            return None;
-        }
         if song.len() < 114 {
             return None;
         }
+        if &song[0..6] != b"Org-02" {
+            return None;
+        }
         let ms_per_beat = song.read_u16(6);
+        if ms_per_beat == 0 {
+            return None;
+        }
         let samples_per_beat = ms_per_beat as f32 * (rate as f32 / 1000.0);
         let loop_start = song.read_u32(10);
         let loop_end = song.read_u32(14);
