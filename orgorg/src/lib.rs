@@ -419,7 +419,8 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
         // Integer multiplication then float cast is slightly faster
         let left = ((self.cur_pan >> 4) as i32 * vol) as f32 * MASTER_VOLUME;
         let right = ((self.cur_pan & 0b00001111) as i32 * vol) as f32 * MASTER_VOLUME;
-        let mono = (self.cur_vol as i32) as f32 * 6.0 * MASTER_VOLUME;
+        let mono = (((self.cur_pan >> 4) + (self.cur_pan & 0b00001111)) as i32 * vol) as f32
+            * (MASTER_VOLUME / 2.0);
         let n = if MONO {
             cmp::min(buf.len(), self.cur_len as usize)
         } else {
