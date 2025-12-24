@@ -42,7 +42,7 @@
 
 use core::{cmp, marker::PhantomData, mem::MaybeUninit, ptr::NonNull};
 
-const MASTER_VOLUME: f32 = 0.25 / 65536.0;
+const MASTER_VOLUME: f32 = 1.0 / (1 << 19) as f32;
 const DRUM_LEN: [usize; 6] = [5000, 10000, 10000, 1000, 10000, 4000];
 const DRUM_OFFSET: [usize; 7] = [0, 5000, 15000, 25000, 26000, 36000, 40000];
 
@@ -605,11 +605,15 @@ impl<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> OrgPlay<'a, I, A> {
     }
 
     /// Generates 1-channel mono audio data.
+    ///
+    /// Values can exceed [-1, 1] range on some songs.
     pub fn synth_mono(&mut self, buf: &mut [f32]) {
         self.synth_impl::<true>(buf);
     }
 
     /// Generates stereo interleaved audio data.
+    ///
+    /// Values can exceed [-1, 1] range on some songs.
     /// # Panics
     ///
     /// Panics if `buf.len()` is not multiple of 2.
