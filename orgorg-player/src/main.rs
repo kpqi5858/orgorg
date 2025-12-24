@@ -73,7 +73,6 @@ enum Commands {
 enum InterpModes {
     Linear,
     None,
-    Lanczos,
     Lagrange,
 }
 
@@ -132,7 +131,6 @@ fn make_dyn_orgplay(
     let res: Box<dyn DynOrgPlay> = match interp {
         InterpModes::Linear => make!(Linear),
         InterpModes::None => make!(NoInterp),
-        InterpModes::Lanczos => make!(Lanczos),
         InterpModes::Lagrange => make!(Lagrange),
     };
     Ok(res)
