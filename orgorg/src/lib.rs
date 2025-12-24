@@ -122,7 +122,8 @@ impl<T: CaveStoryAssetProvider> CaveStoryAssetProviderExt for T {
                 .get_unchecked(idx..idx + 256)
                 .try_into()
                 .unwrap_unchecked();
-            bytemuck::must_cast_ref(w)
+            // u8 to i8 *array* is safe.
+            core::mem::transmute(w)
         }
     }
 
@@ -135,7 +136,8 @@ impl<T: CaveStoryAssetProvider> CaveStoryAssetProviderExt for T {
             let start = *DRUM_OFFSET.get_unchecked(idx);
             let end = *DRUM_OFFSET.get_unchecked(idx + 1);
             let w = self.drum().get_unchecked(start..end);
-            bytemuck::must_cast_slice(w)
+            // But *slice* transmute is not safe, as slice layout isn't guaranteed.
+            core::slice::from_raw_parts(w.as_ptr() as *const i8, w.len())
         }
     }
 }
