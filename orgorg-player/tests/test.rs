@@ -69,7 +69,7 @@ fn test1() {
 
     // It is already extremely slow to run on miri.
     // Don't run these logic tests on miri.
-    #[cfg_attr(miri, ignore)]
+    #[cfg(not(miri))]
     {
         assert!(buf_mono.iter().cloned().all(f32::is_finite));
         assert!(buf_stereo.iter().cloned().all(f32::is_finite));
