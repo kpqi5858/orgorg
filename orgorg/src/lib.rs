@@ -123,8 +123,8 @@ impl<T: CaveStoryAssetProvider> CaveStoryAssetProviderExt for T {
                 .get_unchecked(idx..idx + 256)
                 .try_into()
                 .unwrap_unchecked();
-            // u8 to i8 *array* is safe.
-            core::mem::transmute(w)
+            let w = w as *const [u8; 256] as *const [i8; 256];
+            &*w
         }
     }
 
@@ -137,7 +137,6 @@ impl<T: CaveStoryAssetProvider> CaveStoryAssetProviderExt for T {
             let start = *DRUM_OFFSET.get_unchecked(idx);
             let end = *DRUM_OFFSET.get_unchecked(idx + 1);
             let w = self.drum().get_unchecked(start..end);
-            // But *slice* transmute is not safe, as slice layout isn't guaranteed.
             core::slice::from_raw_parts(w.as_ptr() as *const i8, w.len())
         }
     }
@@ -590,6 +589,7 @@ impl<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> OrgPlay<'a, I, A> {
             loop_end,
             cur_beat: 0,
             // Safety: They are all initialized now.
+            // TODO: Switch to array_assume_init when it lands
             wave_ins: unsafe {
                 core::mem::transmute::<
                     [MaybeUninit<Instrument<'a, I, false>>; 8],
