@@ -240,9 +240,9 @@ pub mod interp_impls {
                 let s4 = *wave.get_unchecked(s4_idx) as f32;
 
                 let c0 = s2;
-                let c1 = s3 - s1 / 3.0 - s2 / 2.0 - s4 / 6.0;
-                let c2 = (s1 + s3) / 2.0 - s2;
-                let c3 = (s4 - s1) / 6.0 + (s2 - s3) / 2.0;
+                let c1 = s3 - s1 * (1.0 / 3.0) - s2 * (1.0 / 2.0) - s4 * (1.0 / 6.0);
+                let c2 = (s1 + s3) * (1.0 / 2.0) - s2;
+                let c3 = (s4 - s1) * (1.0 / 6.0) + (s2 - s3) * (1.0 / 2.0);
 
                 ((c3 * frac + c2) * frac + c1) * frac + c0
             }
