@@ -34,11 +34,13 @@
 //! See orgorg-player project. Run `orgorg-player dump`.
 //!
 //! # Performance
+//! It is fast and does not allocate memory at all. But with following cavests.
+//!
 //! FPU should be present for maximum performance,
 //! since there are lots of single-precision(f32) floating point arithmetic.
 //!
 //! This crate uses some unsafe to boost the performance.
-//! The author tried to ensure correctness but, who knows.
+//! The author tried to ensure correctness but, who knows. Feel free to audit the code.
 
 use core::{cmp, marker::PhantomData, mem::MaybeUninit, ptr::NonNull};
 
@@ -80,17 +82,16 @@ impl U8SliceExt for [u8] {
 /// that holds references to the data.
 ///
 /// But if you want zero-sized provider, use this snippet in your code.
-/// Keep in mind that this will embed Cave Story data in your binary - You can NOT redistribute.
 /// ```ignore
 /// struct ConstAsset;
 ///
 /// impl CaveStoryAssetProvider for ConstAsset {
 ///     fn wavetable(&self) -> &[u8; 25600] {
-///         include_bytes!("wavetable.dat")
+///         include_bytes!("./wavetable.dat")
 ///     }
 ///
 ///     fn drum(&self) -> &[u8; 40000] {
-///         include_bytes!("drums.dat")
+///         include_bytes!("./drums.dat")
 ///     }
 /// }
 /// ```
@@ -162,7 +163,7 @@ pub trait OrgInterpolation {
     /// Interpolate the `wave` from `pos`. **This function is called at audio rate**.
     /// # Safety
     /// Caller must guarantee that
-    /// - `wave` is 256-length wavetable or [1000, 10000] length pxt sample,
+    /// - `wave` is 256-length wavetable or `[1000, 10000]` length pxt sample,
     /// - `pos` is finite value and `0.0 <= pos < wave.len() as f32`.
     ///
     /// These strict requirements can enable more performant code, like [`f32::to_int_unchecked()`].
@@ -260,6 +261,7 @@ struct Instrument<'a, I: OrgInterpolation, const DRUM: bool> {
     // Must be:
     // - If n_events is 0, this pointer can be dangling so never access it
     // - else, this is a start of &'a [u8] with length of n_events * 8
+    // Raw pointer to save a usize space over slice here.
     inst_data_ptr: NonNull<u8>,
     tuning: i16,
     // loop_event: Option<i16> is ergonomic but this saves space
@@ -606,14 +608,14 @@ impl<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> OrgPlay<'a, I, A> {
 
     /// Generates 1-channel mono audio data.
     ///
-    /// Values can exceed [-1, 1] range on some songs.
+    /// Values can exceed `[-1, 1]` range on some songs.
     pub fn synth_mono(&mut self, buf: &mut [f32]) {
         self.synth_impl::<true>(buf);
     }
 
     /// Generates stereo interleaved audio data.
     ///
-    /// Values can exceed [-1, 1] range on some songs.
+    /// Values can exceed `[-1, 1]` range on some songs.
     /// # Panics
     ///
     /// Panics if `buf.len()` is not multiple of 2.
