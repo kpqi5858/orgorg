@@ -42,7 +42,7 @@ struct PxtChannel {
 ///   Waveforms[5][i] = (int8_t)(seed >> 16) / 2;             // Pseudorandom
 /// }
 /// ```
-const PXT_WAVEFORMS: [[i8; 256]; 6] = zerocopy::transmute!(*include_bytes!("./pixtone_ref.dat"));
+const PXT_WAVEFORMS: [[i8; 256]; 6] = zerocopy::include_value!("./pixtone_ref.dat");
 
 impl PxtChannel {
     fn synth(&self) -> Vec<i32> {
