@@ -207,7 +207,12 @@ pub mod interp_impls {
         #[inline(always)]
         unsafe fn interpolate(wave: &[i8], pos: f32) -> f32 {
             // Safety: Caller guarantees that pos is finite, and 0 <= pos < wave.len().
-            unsafe { *wave.get_unchecked(pos.to_int_unchecked::<usize>()) as f32 }
+            unsafe {
+                // Again, i32 cast is faster than usize.
+                let idx = pos.to_int_unchecked::<i32>();
+                core::hint::assert_unchecked(idx >= 0);
+                *wave.get_unchecked(idx as usize) as f32
+            }
         }
     }
 
