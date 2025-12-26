@@ -4,6 +4,9 @@
 //!
 //! Partially based on bisqwit's C++ OrgPlay.
 //!
+//! Only supports `Org-02` music with 6 original Cave Story drums (See
+//! [`CaveStoryAssetProvider::drum`])
+//!
 //! # Example
 //! ```no_run
 //! use orgorg::{OrgPlay, OrgPlayBuilder, AssetByRef, interp_impls::Linear};
@@ -34,7 +37,7 @@
 //! See orgorg-player project. Run `orgorg-player dump`.
 //!
 //! # Performance
-//! It is fast and does not allocate memory at all. But with following cavests.
+//! It is fast and does not allocate memory at all. But with following caveats.
 //!
 //! FPU should be present for maximum performance,
 //! since there are lots of single-precision(f32) floating point arithmetic.
