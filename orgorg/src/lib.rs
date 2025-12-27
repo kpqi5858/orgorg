@@ -150,16 +150,16 @@ unsafe impl<T: CaveStoryAssetProvider> SoundbankProvider for T {
         let drums = CaveStoryAssetProvider::drum(self);
         unsafe {
             let range = match idx {
-                0 => 0..5000,
-                2 => 5000..15000,
-                4 => 15000..25000,
-                5 => 25000..26000,
-                6 => 26000..36000,
-                8 => 36000..40000,
+                0 => (0, 5000),
+                2 => (5000, 10000),
+                4 => (15000, 10000),
+                5 => (25000, 1000),
+                6 => (26000, 10000),
+                8 => (36000, 4000),
                 _ => core::hint::unreachable_unchecked(),
             };
-            let w = drums.get_unchecked(range);
-            core::slice::from_raw_parts(w.as_ptr() as *const i8, w.len())
+            let w = drums.get_unchecked(range.0..);
+            core::slice::from_raw_parts(w.as_ptr() as *const i8, range.1)
         }
     }
 }
