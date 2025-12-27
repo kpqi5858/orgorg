@@ -4,11 +4,9 @@
 //!
 //! Partially based on bisqwit's C++ OrgPlay.
 //!
-//! Only supports `Org-02` music with 6 original Cave Story drums (See
-//! [`CaveStoryAssetProvider::drum`])
-//!
 //! # Example
 //! ```no_run
+//! // Basic example for playing Org-02 music with original Cave Story drum sound effects.
 //! use orgorg::{OrgPlay, OrgPlayBuilder, AssetByRef, interp_impls::Linear};
 //!
 //! let wavetable: &[u8; 25600] = todo!();
@@ -48,8 +46,6 @@
 use core::{cmp, marker::PhantomData, mem::MaybeUninit, ptr::NonNull};
 
 const MASTER_VOLUME: f32 = 1.0 / (1 << 19) as f32;
-const DRUM_LEN: [usize; 6] = [5000, 10000, 10000, 1000, 10000, 4000];
-const DRUM_OFFSET: [usize; 7] = [0, 5000, 15000, 25000, 26000, 36000, 40000];
 
 // For more cleaner internal code. not for pub.
 trait U8SliceExt {
@@ -78,7 +74,10 @@ impl U8SliceExt for [u8] {
     }
 }
 
-/// Provides Cave Story wavetables and drum samples.
+/// Provides original Cave Story wavetable and drum samples to [`OrgPlay`].
+///
+/// With this trait, it can play Org-02 musics that uses original Cave Story drum sound effects.
+/// In other words, drum channel only plays wave 0, 2, 4, 5, 6, 8.
 ///
 /// You don't need to implement this trait to use [`OrgPlay`],
 /// as [`OrgPlayBuilder::with_asset`] will use default implementation
@@ -107,39 +106,59 @@ pub trait CaveStoryAssetProvider {
     fn drum(&self) -> &[u8; 40000];
 }
 
-// Internal helper methods.
-trait CaveStoryAssetProviderExt {
-    unsafe fn get_wavetable(&self, idx: i8) -> &[i8; 256];
-    // MUST NOT return empty array.
-    unsafe fn get_drum(&self, idx: i8) -> &[i8];
+/// Provides wavetable and drum samples to [`OrgPlay`].
+///
+/// You don't really need to implement this trait yourself,
+/// as [`Soundbank`] and [`CaveStoryAssetProvider`] provides implementation for this trait.
+///
+/// # Safety
+/// - Return value of [`SoundbankProvider::is_drum_valid`]
+///   must be consistent for given `idx` across all calls.
+/// - If [`SoundbankProvider::is_drum_valid`] returns `true` for given `idx`,
+///   [`SoundbankProvider::get_drum`] must return a slice with `[16, 500000]` length,
+///   and its length must be consistent across all calls.
+///
+/// In other words, don't tamper with outputs using interior mutability or external source.
+pub unsafe trait SoundbankProvider {
+    /// The original `wavetable.dat` file, or 100 concatenated 256-length waves.
+    fn wavetable(&self) -> &[u8; 25600];
+
+    /// The drum channel with `idx` wave will be silenced if this returns `false`.
+    fn is_drum_valid(&self, idx: u8) -> bool;
+
+    /// Get drum sample of `idx`.
+    /// # Safety
+    /// Caller must not call this function
+    /// if [`SoundbankProvider::is_drum_valid`] with given `idx` would return `false`.
+    unsafe fn get_drum(&self, idx: u8) -> &[i8];
 }
 
-impl<T: CaveStoryAssetProvider> CaveStoryAssetProviderExt for T {
-    // Safety: 0 <= idx < 100
+// Safety: All function is consistent.
+unsafe impl<T: CaveStoryAssetProvider> SoundbankProvider for T {
     #[inline(always)]
-    unsafe fn get_wavetable(&self, idx: i8) -> &[i8; 256] {
-        debug_assert!((0..100).contains(&idx));
-        let idx = idx as usize * 256;
-        unsafe {
-            let w: &[u8; 256] = self
-                .wavetable()
-                .get_unchecked(idx..idx + 256)
-                .try_into()
-                .unwrap_unchecked();
-            let w = w as *const [u8; 256] as *const [i8; 256];
-            &*w
-        }
+    fn wavetable(&self) -> &[u8; 25600] {
+        CaveStoryAssetProvider::wavetable(self)
     }
 
-    // Safety: 0 <= idx < 6
     #[inline(always)]
-    unsafe fn get_drum(&self, idx: i8) -> &[i8] {
-        debug_assert!((0..6).contains(&idx));
-        let idx = idx as usize;
+    fn is_drum_valid(&self, idx: u8) -> bool {
+        matches!(idx, 0 | 2 | 4 | 5 | 6 | 8)
+    }
+
+    #[inline(always)]
+    unsafe fn get_drum(&self, idx: u8) -> &[i8] {
+        let drums = CaveStoryAssetProvider::drum(self);
         unsafe {
-            let start = *DRUM_OFFSET.get_unchecked(idx);
-            let end = *DRUM_OFFSET.get_unchecked(idx + 1);
-            let w = self.drum().get_unchecked(start..end);
+            let range = match idx {
+                0 => 0..5000,
+                2 => 5000..15000,
+                4 => 15000..25000,
+                5 => 25000..26000,
+                6 => 26000..36000,
+                8 => 36000..40000,
+                _ => core::hint::unreachable_unchecked(),
+            };
+            let w = drums.get_unchecked(range);
             core::slice::from_raw_parts(w.as_ptr() as *const i8, w.len())
         }
     }
@@ -160,12 +179,51 @@ impl CaveStoryAssetProvider for AssetByRef<'_> {
     }
 }
 
+/// Custom soundbank by ref.
+///
+/// 43 drums will play Org-03 songs properly.
+#[derive(Clone)]
+pub struct Soundbank<'a> {
+    wavetable: &'a [u8; 25600],
+    drums: &'a [&'a [i8]],
+}
+
+impl<'a> Soundbank<'a> {
+    /// Creates new Soundbank.
+    ///
+    /// - More than 255 `drums` is effectively ignored.
+    /// - If length of a drum is not in `[16, 500000]`,
+    ///   that particular drum is considered invalid and won't play a sound.
+    pub fn new(wavetable: &'a [u8; 25600], drums: &'a [&'a [i8]]) -> Self {
+        Self { wavetable, drums }
+    }
+}
+
+// Safety: All function is consistent.
+unsafe impl SoundbankProvider for Soundbank<'_> {
+    #[inline(always)]
+    fn wavetable(&self) -> &[u8; 25600] {
+        self.wavetable
+    }
+
+    #[inline(always)]
+    fn is_drum_valid(&self, idx: u8) -> bool {
+        let len = self.drums.get(idx as usize).map(|x| x.len()).unwrap_or(0);
+        (16..=500000).contains(&len)
+    }
+
+    #[inline(always)]
+    unsafe fn get_drum(&self, idx: u8) -> &[i8] {
+        unsafe { self.drums.get_unchecked(idx as usize) }
+    }
+}
+
 /// Interpolation for Organya Music synthesis.
 pub trait OrgInterpolation {
     /// Interpolate the `wave` from `pos`. **This function is called at audio rate**.
     /// # Safety
     /// Caller must guarantee that
-    /// - `wave` is 256-length wavetable or `[1000, 10000]` length pxt sample,
+    /// - `wave` is 256-length wavetable or `[16, 500000]` length sample,
     /// - `pos` is finite value and `0.0 <= pos < wave.len() as f32`.
     ///
     /// These strict requirements can enable more performant code, like [`f32::to_int_unchecked()`].
@@ -285,7 +343,7 @@ struct Instrument<'a, I: OrgInterpolation, const DRUM: bool> {
     cur_pan: u8,
     cur_vol: u8,
     // if n_events != 0, must point to valid wave
-    wave_idx: i8,
+    wave_idx: u8,
     cur_len: u32,
     _i: PhantomData<I>,
     _a: PhantomData<&'a [u8]>,
@@ -331,7 +389,10 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
         }
     }
 
-    fn tick(&mut self, (cur_beat, loop_start, samples_per_beat, rate): &(u32, u32, f32, u32)) {
+    fn tick<A: SoundbankProvider>(
+        &mut self,
+        (cur_beat, loop_start, samples_per_beat, rate, sound): &(u32, u32, f32, u32, &A),
+    ) {
         // There is no official documentation for .org file,
         // and these logics are not designed to handle it as leniently as possible.
         // It assumes that event is sorted by its beat, and no more event after loop_end.
@@ -374,7 +435,7 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
             let rate = *rate as f32;
             if DRUM {
                 // Safety: See wave_idx field comment
-                let wave_len = unsafe { *DRUM_LEN.get_unchecked(self.wave_idx as usize) };
+                let wave_len = unsafe { sound.get_drum(self.wave_idx).len() };
                 let phase_inc = (event.note as i32 * 800 + 100) as f32 / rate;
                 // This is needed for OrgInterpolation trait invariant.
                 // And if this condition is false, then the pitch isn't in RATE at all.
@@ -408,20 +469,29 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
     // This function is the critical part of overall performance.
     // Previously, there was val() method that returns a sample value, which was obviously slower.
     // And as expected, fill_buf is ~1.6x faster than individual val() calls
-    fn fill_buf<A: CaveStoryAssetProvider, const MONO: bool>(&mut self, buf: &mut [f32], a: &A) {
+    fn fill_buf<A: SoundbankProvider, const MONO: bool>(&mut self, buf: &mut [f32], a: &A) {
         if self.cur_len == 0 {
             return;
         }
         // Safety: See wave_idx field comment
         let cur_wave = unsafe {
             if DRUM {
+                debug_assert!(a.is_drum_valid(self.wave_idx));
                 a.get_drum(self.wave_idx)
             } else {
-                a.get_wavetable(self.wave_idx)
+                debug_assert!((0..100).contains(&self.wave_idx));
+                let idx = self.wave_idx as usize * 256;
+                let w: &[u8; 256] = a
+                    .wavetable()
+                    .get_unchecked(idx..idx + 256)
+                    .try_into()
+                    .unwrap_unchecked();
+                let w = w as *const [u8; 256] as *const [i8; 256];
+                &*w
             }
         };
         let len = cur_wave.len();
-        // Safety: CaveStoryAssetProviderExt never return empty array.
+        // Safety: SoundbankProvider never return empty array.
         // This will eliminate "rem by zero" panic code.
         unsafe { core::hint::assert_unchecked(len != 0) }
         let vol = self.cur_vol as i32;
@@ -439,7 +509,7 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
         let inc = self.phase_inc;
         for i in 0..n {
             // Safety:
-            // CaveStoryAssetProviderExt never return invalid length array.
+            // SoundbankProvider never return invalid length array.
             // There is check in tick() method that ensures 0 <= phase_inc < len.
             // And at the end of this for loop, pos is wrapped.
             let sample = unsafe {
@@ -470,9 +540,9 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
 }
 
 /// `no_std` compatible Cave Story Organya Music Player.
-pub struct OrgPlay<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> {
-    // I want to make this integer, but then RATE must be multiple of 1000.
+pub struct OrgPlay<'a, I: OrgInterpolation, A: SoundbankProvider> {
     sample_rate: u32,
+    // I want to make this integer, but then RATE must be multiple of 1000.
     samples_per_beat: f32,
     remaining_samples: f32,
     loop_start: u32,
@@ -483,12 +553,12 @@ pub struct OrgPlay<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> {
     asset: A,
 }
 
-impl<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> OrgPlay<'a, I, A> {
+impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
     fn new(asset: A, song: &'a [u8], rate: u32) -> Option<Self> {
         if song.len() < 114 {
             return None;
         }
-        if &song[0..6] != b"Org-02" {
+        if !matches!(&song[0..6], b"Org-02" | b"Org-03") {
             return None;
         }
         let ms_per_beat = song.read_u16(6);
@@ -501,7 +571,7 @@ impl<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> OrgPlay<'a, I, A> {
 
         let mut offset = 18;
         let mut ins_data_offset = 114;
-        let tick_args = &(0, loop_start, samples_per_beat, rate);
+        let tick_args = &(0, loop_start, samples_per_beat, rate, &asset);
 
         // core::array really needs try_from_fn, or array::try_map
         // Instrument does not allocate anything so no risk of memory leak when early returns.
@@ -509,7 +579,7 @@ impl<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> OrgPlay<'a, I, A> {
         let mut drum_ins = [const { MaybeUninit::uninit() }; 8];
 
         for val in &mut wave_ins {
-            let wave = song.read_i8(offset + 2);
+            let wave = song[offset + 2];
             let valid_wave = (0..100).contains(&wave);
 
             let n_events = song.read_u16(offset + 4);
@@ -545,12 +615,8 @@ impl<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> OrgPlay<'a, I, A> {
             val.write(ret);
         }
         for val in &mut drum_ins {
-            // -1 means there is no corresponding drum effect.
-            const DRUM_MAPPING: [i8; 12] = [0, -1, 1, -1, 2, 3, 4, -1, 5, -1, -1, -1];
-            let wave = *DRUM_MAPPING
-                .get(song.read_i8(offset + 2) as usize)
-                .unwrap_or(&-1);
-
+            let wave = song[offset + 2];
+            let valid_wave = asset.is_drum_valid(wave);
             let n_events = song.read_u16(offset + 4);
             let pi = if song.read_i8(offset + 3) != 0 { 1 } else { 0 };
             let inst_data_ptr = if n_events == 0 {
@@ -565,7 +631,7 @@ impl<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> OrgPlay<'a, I, A> {
                 inst_data_ptr,
                 tuning: song.read_i16(offset),
                 pi_loop_calculated: pi,
-                n_events: if wave == -1 { 0 } else { n_events }, // Must be 0 for invalid wave
+                n_events: if valid_wave { n_events } else { 0 }, // Must be 0 for invalid wave
                 phase_inc: 0.0,
                 phase_acc: 0.0,
                 cur_pan: 0,
@@ -651,6 +717,7 @@ impl<'a, I: OrgInterpolation, A: CaveStoryAssetProvider> OrgPlay<'a, I, A> {
                     self.loop_start,
                     self.samples_per_beat,
                     self.sample_rate,
+                    &self.asset,
                 );
                 for w in &mut self.wave_ins {
                     w.tick(tick_args);
@@ -742,10 +809,14 @@ impl<I, A> OrgPlayBuilder<I, A> {
         OrgPlayBuilder(self.0, self.1, rate)
     }
 
+    /// Will only properly play songs with original Cave Story drum sound effects.
+    /// See [`CaveStoryAssetProvider`] for more information.
     pub fn with_asset_provider<A2: CaveStoryAssetProvider>(self, a: A2) -> OrgPlayBuilder<I, A2> {
-        OrgPlayBuilder(PhantomData, a, self.2)
+        self.with_soundbank_provider(a)
     }
 
+    /// Will only properly play songs with original Cave Story drum sound effects.
+    /// See [`CaveStoryAssetProvider`] for more information.
     pub fn with_asset<'a>(
         self,
         wavetable: &'a [u8; 25600],
@@ -753,12 +824,20 @@ impl<I, A> OrgPlayBuilder<I, A> {
     ) -> OrgPlayBuilder<I, AssetByRef<'a>> {
         self.with_asset_provider(AssetByRef(wavetable, drum))
     }
+
+    pub fn with_soundbank(self, a: Soundbank) -> OrgPlayBuilder<I, Soundbank> {
+        self.with_soundbank_provider(a)
+    }
+
+    pub fn with_soundbank_provider<A2: SoundbankProvider>(self, a: A2) -> OrgPlayBuilder<I, A2> {
+        OrgPlayBuilder(PhantomData, a, self.2)
+    }
 }
 
 impl<I, A> OrgPlayBuilder<I, A>
 where
     I: OrgInterpolation,
-    A: CaveStoryAssetProvider,
+    A: SoundbankProvider,
 {
     /// Returns None if song is invalid.
     pub fn build<'a>(self, song: &'a [u8]) -> Option<OrgPlay<'a, I, A>> {
