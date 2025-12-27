@@ -3,10 +3,10 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    io::{Write, stdout},
+    io::{Write, stderr, stdout},
     path::{Path, PathBuf},
     sync::{
-        Arc, OnceLock,
+        Arc,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     time::Duration,
@@ -19,23 +19,21 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
 use is_terminal::IsTerminal;
-use orgorg::{CaveStoryAssetProvider, OrgInterpolation, OrgPlay, OrgPlayBuilder};
-use ouroboros::self_referencing;
+use orgorg::{CaveStoryAssetProvider, OrgPlay, OrgPlayBuilder, Soundbank};
+use self_cell::self_cell;
 
 use crate::pxt::synth_pxt;
 
 mod pxt;
 
-static ASSET_BY_DUMP: OnceLock<AssetByDump> = OnceLock::new();
-
 /// A player for Organya Music.
-/// Requires original Doukutsu.exe from dou_1006.zip in the working directory.
+/// Requires soundbank.wdb, or original Doukutsu.exe from dou_1006.zip in the working directory
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Cli {
-    /// Specify Doukutsu.exe file
+    /// Specify Doukutsu.exe, or soundbank.wdb file
     #[arg(long)]
-    exe: Option<PathBuf>,
+    sound: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Commands,
@@ -47,13 +45,13 @@ struct AudioConfig {
     #[arg(long)]
     raw: bool,
     /// Mono output
-    #[arg(long)]
+    #[arg(long, short)]
     mono: bool,
     /// Sample rate
-    #[arg(long, default_value = "48000")]
+    #[arg(long, short, default_value = "48000")]
     rate: u32,
     /// Interpolation to use
-    #[arg(long, value_enum, default_value = "lagrange")]
+    #[arg(long, short, value_enum, default_value = "lagrange")]
     interp: InterpModes,
 }
 
@@ -76,15 +74,109 @@ enum InterpModes {
     Lagrange,
 }
 
-// Bad API design lol. Requires user to do this shit.
-// Well, self-referential struct isn't that bad.
-// But compile-time generics -> runtime polymorphism is painful.
-#[self_referencing]
-struct OwnedOrgPlay<I: OrgInterpolation, A: CaveStoryAssetProvider> {
+// My API is painful for advanced uses. It needs self-referential structs.
+struct OwnedSoundbankImpl<'a>(&'a [u8; 25600], Vec<&'a [i8]>);
+self_cell!(
+    struct OwnedSoundbank {
+        owner: Vec<u8>,
+        #[covariant]
+        dependent: OwnedSoundbankImpl,
+    }
+);
+
+impl OwnedSoundbank {
+    fn make_soundbank<'a>(&'a self) -> Soundbank<'a> {
+        Soundbank::new(
+            self.borrow_dependent().0,
+            self.borrow_dependent().1.as_slice(),
+        )
+    }
+}
+
+fn from_soundbank_wdb(mut wdb: Vec<u8>) -> Option<OwnedSoundbank> {
+    fn fix_offset(wdb: &mut [u8]) -> Option<()> {
+        if wdb.len() < 25600 {
+            return None;
+        }
+        let mut offset = 25600;
+        while offset < wdb.len() {
+            let len = u32::from_le_bytes(wdb.get(offset..offset + 4)?.try_into().unwrap()) as usize;
+            let slice: &mut [i8] =
+                zerocopy::transmute_mut!(wdb.get_mut(offset + 4..offset + 4 + len)?);
+            slice
+                .iter_mut()
+                .for_each(|v| *v = v.wrapping_sub_unsigned(0x80));
+            offset += 4 + len;
+        }
+        Some(())
+    }
+    fix_offset(&mut wdb)?;
+    Some(OwnedSoundbank::new(wdb, |v| {
+        let wavetable = v[0..25600].try_into().unwrap();
+        let mut drums = vec![];
+        let mut offset = 25600;
+        while offset < v.len() {
+            let len = u32::from_le_bytes(v[offset..offset + 4].try_into().unwrap()) as usize;
+            let slice = &v[offset + 4..offset + 4 + len];
+            drums.push(zerocopy::transmute_ref!(slice));
+            offset += len + 4;
+        }
+        OwnedSoundbankImpl(wavetable, drums)
+    }))
+}
+
+fn make_dyn_orgplay(
     org: Vec<u8>,
-    #[borrows(org)]
-    #[covariant]
-    player: OrgPlay<'this, I, A>,
+    soundbank: OwnedSoundbank,
+    interp: InterpModes,
+    sample_rate: u32,
+) -> Result<Box<dyn DynOrgPlay>> {
+    use orgorg::interp_impls;
+    // What a beautiful macro. Pretty clever isn't it?
+    macro_rules! make {
+        ($t:ident) => {{
+            type _OrgPlay<'a> = OrgPlay<'a, interp_impls::$t, Soundbank<'a>>;
+            self_cell!(
+                struct _ImplDetail {
+                    owner: (Vec<u8>, OwnedSoundbank),
+                    #[covariant]
+                    dependent: _OrgPlay,
+                }
+            );
+            impl DynOrgPlay for _ImplDetail {
+                fn synth_mono(&mut self, buf: &mut [f32]) {
+                    self.with_dependent_mut(|_, m| m.synth_mono(buf));
+                }
+
+                fn synth_stereo(&mut self, buf: &mut [f32]) {
+                    self.with_dependent_mut(|_, m| m.synth_stereo(buf));
+                }
+
+                fn get_loop(&self) -> (u32, u32) {
+                    self.with_dependent(|_, m| m.get_loop())
+                }
+
+                fn get_beat(&self) -> u32 {
+                    self.with_dependent(|_, m| m.get_beat())
+                }
+            }
+            Box::new(_ImplDetail::try_new((org, soundbank), |a| {
+                OrgPlayBuilder::new()
+                    .with_sample_rate(sample_rate)
+                    .with_soundbank_provider(a.1.make_soundbank())
+                    .with_interpolation(interp_impls::$t)
+                    .build(&a.0)
+                    .context("Invalid org music")
+            })?)
+        }};
+    }
+
+    let i: Box<dyn DynOrgPlay> = match interp {
+        InterpModes::Linear => make!(Linear),
+        InterpModes::Lagrange => make!(Lagrange),
+        InterpModes::None => make!(NoInterp),
+    };
+    Ok(i)
 }
 
 trait DynOrgPlay: Send {
@@ -92,48 +184,6 @@ trait DynOrgPlay: Send {
     fn synth_stereo(&mut self, buf: &mut [f32]);
     fn get_loop(&self) -> (u32, u32);
     fn get_beat(&self) -> u32;
-}
-
-impl<I: OrgInterpolation, A: CaveStoryAssetProvider + Send> DynOrgPlay for OwnedOrgPlay<I, A> {
-    fn synth_mono(&mut self, buf: &mut [f32]) {
-        self.with_player_mut(|player| player.synth_mono(buf));
-    }
-    fn synth_stereo(&mut self, buf: &mut [f32]) {
-        self.with_player_mut(|player| player.synth_stereo(buf));
-    }
-    fn get_loop(&self) -> (u32, u32) {
-        self.with_player(|player| player.get_loop())
-    }
-    fn get_beat(&self) -> u32 {
-        self.with_player(|player| player.get_beat())
-    }
-}
-
-fn make_dyn_orgplay(
-    org: Vec<u8>,
-    interp: InterpModes,
-    sample_rate: u32,
-) -> Result<Box<dyn DynOrgPlay>> {
-    use orgorg::interp_impls;
-    // At least we can use macro here.
-    macro_rules! make {
-        ($t:tt) => {
-            Box::new(OwnedOrgPlay::try_new(org, |o| {
-                OrgPlayBuilder::new()
-                    .with_sample_rate(sample_rate)
-                    .with_asset_provider(ASSET_BY_DUMP.get().unwrap())
-                    .with_interpolation(interp_impls::$t)
-                    .build(o)
-                    .context("Invalid org music")
-            })?)
-        };
-    }
-    let res: Box<dyn DynOrgPlay> = match interp {
-        InterpModes::Linear => make!(Linear),
-        InterpModes::None => make!(NoInterp),
-        InterpModes::Lagrange => make!(Lagrange),
-    };
-    Ok(res)
 }
 
 fn find_config(device: &Device, config: &AudioConfig) -> Result<StreamConfig> {
@@ -148,11 +198,16 @@ fn find_config(device: &Device, config: &AudioConfig) -> Result<StreamConfig> {
         }
     }
 
-    anyhow::bail!("Cannot find suitable config")
+    anyhow::bail!("Cannot find suitable audio output config")
 }
 
-fn player_raw(config: &AudioConfig, org: Vec<u8>, mut write: impl Write) -> Result<()> {
-    let mut player = make_dyn_orgplay(org, config.interp, config.rate)?;
+fn player_raw(
+    config: &AudioConfig,
+    soundbank: OwnedSoundbank,
+    org: Vec<u8>,
+    mut write: impl Write,
+) -> Result<()> {
+    let mut player = make_dyn_orgplay(org, soundbank, config.interp, config.rate)?;
     let mut buf = [0.0_f32; 4096];
     loop {
         if config.mono {
@@ -166,6 +221,7 @@ fn player_raw(config: &AudioConfig, org: Vec<u8>, mut write: impl Write) -> Resu
 
 fn player(
     device: &Device,
+    soundbank: OwnedSoundbank,
     config: StreamConfig,
     interp: InterpModes,
     org: Vec<u8>,
@@ -174,7 +230,7 @@ fn player(
 ) -> Result<()> {
     let channels = config.channels;
 
-    let mut player = make_dyn_orgplay(org, interp, config.sample_rate.0)?;
+    let mut player = make_dyn_orgplay(org, soundbank, interp, config.sample_rate.0)?;
     let (loop_start, loop_end) = player.get_loop();
     control.loop_start.store(loop_start, Ordering::Relaxed);
     control.loop_end.store(loop_end, Ordering::Relaxed);
@@ -191,7 +247,7 @@ fn player(
             match channels {
                 1 => player.synth_mono(data),
                 2 => player.synth_stereo(data),
-                _ => (),
+                _ => unreachable!(),
             }
             ctrl.played_samples
                 .fetch_add(data.len() as u64, Ordering::Relaxed);
@@ -271,28 +327,93 @@ fn dump_and_synth(file: &Path) -> Result<AssetByDump> {
     Ok(AssetByDump(wavetable, drums))
 }
 
+fn to_soundbank(asset: AssetByDump) -> OwnedSoundbank {
+    let mut data = vec![];
+    data.extend(asset.0);
+    data.extend(asset.1);
+    OwnedSoundbank::new(data, |d| {
+        let (wavetable, drums) = d.split_at(25600);
+        let drums: &[i8] = zerocopy::transmute_ref!(drums);
+        let drums = vec![
+            &drums[0..5000],
+            &[],
+            &drums[5000..15000],
+            &[],
+            &drums[15000..25000],
+            &drums[25000..26000],
+            &drums[26000..36000],
+            &[],
+            &drums[36000..40000],
+        ];
+        OwnedSoundbankImpl(wavetable.try_into().unwrap(), drums)
+    })
+}
+
+// If user specified path, first try as Doukutsu.exe, then try as wdb
+// Else, first try ./soundbank.wdb, then try ./Doukutsu.exe
+fn determine_soundbank(sound: Option<&Path>) -> Result<OwnedSoundbank> {
+    let soundbank = match sound {
+        Some(path) => match dump_and_synth(path) {
+            Ok(asset) => {
+                eprintln!("Using original Cave Story sounds");
+                to_soundbank(asset)
+            }
+            Err(err) => {
+                eprintln!("Using soundbank from {}", path.to_string_lossy());
+                let wdb = std::fs::read(path)?;
+                from_soundbank_wdb(wdb)
+                    .context(err.context(format!(
+                        "Tried but failed to extract sound from {} as Doukutsu.exe",
+                        path.to_string_lossy()
+                    )))
+                    .context("Invalid wdb")?
+            }
+        },
+        None => {
+            let wdb = std::fs::read("./soundbank.wdb");
+            if let Ok(wdb) = wdb {
+                eprintln!("Using soundbank from ./soundbank.wdb");
+                from_soundbank_wdb(wdb).context("Invalid wdb")?
+            } else {
+                let path = PathBuf::from("./Doukutsu.exe");
+                if path.exists() {
+                    eprintln!("Using original Cave Story sounds");
+                    to_soundbank(dump_and_synth(&path)?)
+                } else {
+                    anyhow::bail!(
+                        "Cannot find soundbank.wdb or Doukutsu.exe from working directory. Please specify with --sound argument."
+                    )
+                }
+            }
+        }
+    };
+    Ok(soundbank)
+}
+
 fn main() -> Result<()> {
     let args = Cli::parse();
-    let exe = args.exe.unwrap_or(PathBuf::from("./Doukutsu.exe"));
-    if !std::fs::exists(&exe)? {
-        anyhow::bail!("Cannot find {exe:?} in working directory.");
-    }
-    ASSET_BY_DUMP.set(dump_and_synth(&exe)?).unwrap();
 
     match args.command {
         Commands::Dump => {
-            std::fs::write("./wavetable.dat", ASSET_BY_DUMP.get().unwrap().0.as_slice())?;
+            let exe = args.sound.unwrap_or(PathBuf::from("./Doukutsu.exe"));
+            let asset_by_dump =
+                dump_and_synth(&exe).context("Cannot extract sound from Doukutsu.exe")?;
+            std::fs::write("./wavetable.dat", asset_by_dump.0.as_slice())?;
             println!("Wrote wavetables to ./wavetable.dat");
-            std::fs::write("./drums.dat", ASSET_BY_DUMP.get().unwrap().1.as_slice())?;
+            std::fs::write("./drums.dat", asset_by_dump.1.as_slice())?;
             println!("Wrote drums to ./drums.dat");
             Ok(())
         }
         Commands::Play { path, config } => {
+            if config.rate < 1000 {
+                anyhow::bail!("Sample rate cannot be less than 1000");
+            }
+            let soundbank = determine_soundbank(args.sound.as_deref())?;
             let org = std::fs::read(path).context("Cannot open .org file")?;
 
             if config.raw {
                 let stdout = stdout().lock();
-                return player_raw(&config, org, stdout);
+                return player_raw(&config, soundbank, org, stdout);
             }
 
             let interp = config.interp;
@@ -308,10 +429,18 @@ fn main() -> Result<()> {
             let config = find_config(&device, &config)?;
 
             let join = std::thread::spawn(move || {
-                player(&device, config, interp, org, control_clone, exit_receiver)
+                player(
+                    &device,
+                    soundbank,
+                    config,
+                    interp,
+                    org,
+                    control_clone,
+                    exit_receiver,
+                )
             });
 
-            let mut stdout = stdout();
+            let mut stdout = stderr();
             let tick_rate = Duration::from_millis(50);
             loop {
                 // Only print stat if it's terminal
