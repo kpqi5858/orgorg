@@ -220,14 +220,14 @@ unsafe impl SoundbankProvider for Soundbank<'_> {
 
 /// Interpolation for Organya Music synthesis.
 pub trait OrgInterpolation {
-    /// Interpolate the `wave` from `pos`. **This function is called at audio rate**.
+    /// Interpolate the `wave` from `(pos).(frac)`. **This function is called at audio rate**.
     /// # Safety
     /// Caller must guarantee that
     /// - `wave` is 256-length wavetable or `[16, 500000]` length sample,
-    /// - `pos` is finite value and `0.0 <= pos < wave.len() as f32`.
+    /// - `0 <= pos < wave.len()`.
     ///
     /// These strict requirements can enable more performant code, like [`f32::to_int_unchecked()`].
-    unsafe fn interpolate(wave: &[i8], pos: f32) -> f32;
+    unsafe fn interpolate(wave: &[i8], pos: u32, frac: f32) -> f32;
 }
 
 /// Builtin [`OrgInterpolation`] implementations.
@@ -237,21 +237,12 @@ pub mod interp_impls {
     pub struct Linear;
 
     impl OrgInterpolation for Linear {
-        // This function is carefully written with profiling and Compiler Explorer in Rust 1.92
         #[inline(always)]
-        unsafe fn interpolate(wave: &[i8], pos: f32) -> f32 {
+        unsafe fn interpolate(wave: &[i8], pos: u32, frac: f32) -> f32 {
             let len = wave.len();
             // Safety: Caller guarantees that pos is finite, and 0 <= pos < wave.len().
             unsafe {
-                // naive `pos % 1.0` is **300% slower**..WTF?
-                // `pos - libm::truncf(pos)` is 20% slower.
-                // f32::to_int_unchecked is another significant speedup.
-                let pos_i = pos.to_int_unchecked::<i32>();
-                // Saves one instruction in aarch64.
-                core::hint::assert_unchecked(pos_i >= 0);
-                let frac = pos - (pos_i as f32);
-                // pos.to_int_unchecked::<usize>() is slower than this cast.
-                let pos_idx = pos_i as usize;
+                let pos_idx = pos as usize;
                 let sample1 = *wave.get_unchecked(pos_idx);
                 let sample2 = *wave.get_unchecked((pos_idx + 1) % len);
                 // The "imprecise" lerp (see Wikipedia Linear Interpolation).
@@ -266,14 +257,9 @@ pub mod interp_impls {
 
     impl OrgInterpolation for NoInterp {
         #[inline(always)]
-        unsafe fn interpolate(wave: &[i8], pos: f32) -> f32 {
+        unsafe fn interpolate(wave: &[i8], pos: u32, _frac: f32) -> f32 {
             // Safety: Caller guarantees that pos is finite, and 0 <= pos < wave.len().
-            unsafe {
-                // Again, i32 cast is faster than usize.
-                let idx = pos.to_int_unchecked::<i32>();
-                core::hint::assert_unchecked(idx >= 0);
-                *wave.get_unchecked(idx as usize) as f32
-            }
+            unsafe { *wave.get_unchecked(pos as usize) as f32 }
         }
     }
 
@@ -282,14 +268,11 @@ pub mod interp_impls {
 
     impl OrgInterpolation for Lagrange {
         #[inline(always)]
-        unsafe fn interpolate(wave: &[i8], pos: f32) -> f32 {
+        unsafe fn interpolate(wave: &[i8], pos: u32, frac: f32) -> f32 {
             // Safety: Caller guarantees that pos is finite, and 0 <= pos < wave.len().
             unsafe {
                 let len = wave.len();
-                let pos_i = pos.to_int_unchecked::<i32>();
-                core::hint::assert_unchecked(pos_i >= 0);
-                let frac = pos - (pos_i as f32);
-                let pos = pos_i as usize;
+                let pos = pos as usize;
                 let s1 = *wave.get_unchecked(if pos == 0 { len - 1 } else { pos - 1 }) as f32;
                 let s2 = *wave.get_unchecked(pos) as f32;
                 let s3 = *wave.get_unchecked((pos + 1) % len) as f32;
@@ -339,7 +322,8 @@ struct Instrument<'a, I: OrgInterpolation, const DRUM: bool> {
     // TODO: Pre-calculate this value, not on the fly
     loop_event: u16,
     phase_inc: f32,
-    phase_acc: f32,
+    phase_acc: u32,
+    phase_acc_sub: f32,
     cur_pan: u8,
     cur_vol: u8,
     // if n_events != 0, must point to valid wave
@@ -430,7 +414,8 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
             self.cur_pan = (left << 4) | right;
         }
         if event.note != 255 {
-            self.phase_acc = 0.0;
+            self.phase_acc = 0;
+            self.phase_acc_sub = 0.0;
             self.cur_len = 0;
             let rate = *rate as f32;
             if DRUM {
@@ -490,10 +475,7 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
                 &*w
             }
         };
-        let len = cur_wave.len();
-        // Safety: SoundbankProvider never return empty array.
-        // This will eliminate "rem by zero" panic code.
-        unsafe { core::hint::assert_unchecked(len != 0) }
+        let len = cur_wave.len() as u32;
         let vol = self.cur_vol as i32;
         // Integer multiplication then float cast is slightly faster
         let left = ((self.cur_pan >> 4) as i32 * vol) as f32 * MASTER_VOLUME;
@@ -505,16 +487,29 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
         } else {
             cmp::min(buf.len() / 2, self.cur_len as usize)
         };
-        let mut pos = self.phase_acc;
         let inc = self.phase_inc;
+        // Safety:
+        // There is check in tick() method that ensures 0 <= phase_inc < len.
+        let inc_i = unsafe {
+            let i = self.phase_inc.to_int_unchecked::<i32>();
+            // Saves an instruction needed for sign extension.
+            core::hint::assert_unchecked(i >= 0);
+            i as u32
+        };
+        let inc_sub = inc - inc_i as f32;
+        let mut pos = self.phase_acc;
+        let mut pos_sub = self.phase_acc_sub;
         for i in 0..n {
             // Safety:
             // SoundbankProvider never return invalid length array.
             // There is check in tick() method that ensures 0 <= phase_inc < len.
+            // Therefore, 0 <= pos < len.
             // And at the end of this for loop, pos is wrapped.
             let sample = unsafe {
-                debug_assert!(pos.is_finite() && 0.0 <= pos && pos < len as f32);
-                I::interpolate(cur_wave, pos)
+                debug_assert!(pos < len);
+                // Technically failing this assert does not cause UB, but just for correctness.
+                debug_assert!((0.0..1.0).contains(&pos_sub));
+                I::interpolate(cur_wave, pos, pos_sub)
             };
             // Seems compiler can't prove that no out of bounds will happen here. Interesting.
             unsafe {
@@ -525,16 +520,17 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
                     *buf.get_unchecked_mut(i * 2 + 1) += sample * right;
                 }
             }
-            // It actually produces audible pitch instability as number builds up.
-            // So, naively wrap the value before it becomes too inaccurate.
-            // f64 is another naive fix, but best fix is fixed point numbers.
-            // And fixed point could improve overall performance as well, especially on hardware without FPU.
-            pos += inc;
-            if pos >= len as f32 {
-                pos -= len as f32;
+            pos_sub += inc_sub;
+            // We know that pos_sub is in 0..1 range so this is faster than naive integer cast.
+            let val = if pos_sub >= 1.0 { 1 } else { 0 };
+            pos += val as u32 + inc_i;
+            pos_sub -= val as f32;
+            if pos >= len {
+                pos -= len;
             }
         }
         self.phase_acc = pos;
+        self.phase_acc_sub = pos_sub;
         self.cur_len -= n as u32;
     }
 }
@@ -598,7 +594,8 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
                 pi_loop_calculated: pi,
                 n_events: if valid_wave { n_events } else { 0 }, // Must be 0 for invalid wave
                 phase_inc: 0.0,
-                phase_acc: 0.0,
+                phase_acc: 0,
+                phase_acc_sub: 0.0,
                 cur_pan: 0,
                 cur_vol: 0,
                 cur_len: 0,
@@ -633,7 +630,8 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
                 pi_loop_calculated: pi,
                 n_events: if valid_wave { n_events } else { 0 }, // Must be 0 for invalid wave
                 phase_inc: 0.0,
-                phase_acc: 0.0,
+                phase_acc: 0,
+                phase_acc_sub: 0.0,
                 cur_pan: 0,
                 cur_vol: 0,
                 cur_len: 0,
