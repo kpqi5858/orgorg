@@ -1,6 +1,9 @@
 use core::f32;
 
-use orgorg::{CaveStoryAssetProvider, OrgPlayBuilder, interp_impls::Linear};
+use orgorg::{
+    CaveStoryAssetProvider, OrgPlayBuilder,
+    interp_impls::{Linear, NoInterp},
+};
 
 struct DummyProvider;
 
@@ -38,6 +41,32 @@ fn empty() {
     let mut buf = vec![f32::NAN; 1024];
     player.synth_stereo(&mut buf);
     assert!(buf.iter().all(|v| *v == 0.0));
+}
+
+#[test]
+fn extreme_value() {
+    let mut song = *include_bytes!("./test1.org");
+    // Set ms_per_beat to 65536
+    song[6] = 0xff;
+    song[7] = 0xff;
+    let mut player = OrgPlayBuilder::new()
+        .with_sample_rate(u32::MAX)
+        .with_interpolation(NoInterp)
+        .with_asset_provider(DummyProvider)
+        .build(&song)
+        .unwrap();
+    let mut buf = vec![0.0; 4096];
+    player.synth_stereo(&mut buf);
+    // Set ms_per_beat to 1
+    song[6] = 0x01;
+    song[7] = 0x00;
+    let mut player = OrgPlayBuilder::new()
+        .with_sample_rate(1001)
+        .with_interpolation(NoInterp)
+        .with_asset_provider(DummyProvider)
+        .build(&song)
+        .unwrap();
+    player.synth_stereo(&mut buf);
 }
 
 #[test]
