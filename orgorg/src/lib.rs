@@ -223,10 +223,10 @@ pub trait OrgInterpolation {
     /// Interpolate the `wave` from `(pos).(frac)`. **This function is called at audio rate**.
     /// # Safety
     /// Caller must guarantee that
-    /// - `wave` is 256-length wavetable or `[16, 500000]` length sample,
-    /// - `0 <= pos < wave.len()`.
+    /// - `wave` is 256-length wave or `[16, 500000]` length sample,
+    /// - `pos < wave.len()`.
     ///
-    /// These strict requirements can enable more performant code, like [`f32::to_int_unchecked()`].
+    /// These strict requirements can enable more performant code.
     unsafe fn interpolate(wave: &[i8], pos: u32, frac: f32) -> f32;
 }
 
@@ -503,8 +503,8 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
             // Safety:
             // SoundbankProvider never return invalid length array.
             // There is check in tick() method that ensures 0 <= phase_inc < len.
-            // Therefore, 0 <= pos < len.
             // And at the end of this for loop, pos is wrapped.
+            // Therefore, 0 <= pos < len.
             let sample = unsafe {
                 debug_assert!(pos < len);
                 // Technically failing this assert does not cause UB, but just for correctness.
@@ -785,8 +785,13 @@ impl OrgPlayBuilder<(), ()> {
     /// Creates new OrgPlayBuilder.
     /// Initial default is [`Linear`](crate::interp_impls::Linear) interpolation and sample rate of 48000Hz.
     ///
-    /// Provide Cave Story wavetables and drums
-    /// by [`with_asset`](Self::with_asset), or [`with_asset_provider`](Self::with_asset_provider).
+    /// Provide soundbank by:
+    /// - [`with_soundbank`](Self::with_soundbank)
+    /// - [`with_soundbank_provider`](Self::with_soundbank_provider)
+    ///
+    /// Or, provide original Cave Story wavetable and drums by:
+    /// - [`with_asset`](Self::with_asset)
+    /// - [`with_asset_provider`](Self::with_asset_provider).
     ///
     /// Otherwise it is compile error to call [`build`](Self::build).
     pub fn new() -> OrgPlayBuilder<crate::interp_impls::Linear, ()> {
