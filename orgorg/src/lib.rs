@@ -564,6 +564,9 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
         let samples_per_beat = ms_per_beat as f32 * (rate as f32 / 1000.0);
         let loop_start = song.read_u32(10);
         let loop_end = song.read_u32(14);
+        if loop_end < loop_start {
+            return None;
+        }
 
         let mut offset = 18;
         let mut ins_data_offset = 114;
@@ -705,7 +708,7 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
             if self.remaining_samples <= 0.0 {
                 self.remaining_samples += self.samples_per_beat;
                 self.cur_beat += 1;
-                if self.cur_beat == self.loop_end {
+                if self.cur_beat >= self.loop_end {
                     self.cur_beat = self.loop_start;
                 }
                 // Since they don't change, making and passing a reference to the tuple is
@@ -724,6 +727,7 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
                     w.tick(tick_args);
                 }
             }
+            debug_assert!(self.remaining_samples > 0.0);
             let from_raw = filled_raw;
             // Seems compiler can't treat channel as const and optimize here.
             // let channel = if MONO { 1 } else { 2 };
