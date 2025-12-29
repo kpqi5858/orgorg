@@ -3,6 +3,10 @@ name = "orgorg"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+description = "no_std compatible Cave Story Organya Music Player"
+categories = ["no-std", "no-std::no-alloc", "multimedia::audio"]
+keywords = ["no_std", "audio", "music"]
+repository = "https://github.com/kpqi5858/orgorg"
 
 [dependencies]
 libm = "0.2.15"
