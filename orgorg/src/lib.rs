@@ -403,7 +403,8 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
                 let in_pitch = phase_inc.is_finite() && (0.0..wave_len as f32).contains(&phase_inc);
                 if in_pitch {
                     self.phase_inc = phase_inc;
-                    self.cur_len = (wave_len as f32 / phase_inc) as u32;
+                    // Length logic will be handled in fill_buf
+                    self.cur_len = 1;
                 }
             } else {
                 const FRQ_TABLE: [i32; 12] =
@@ -418,6 +419,8 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
                 if in_pitch {
                     self.phase_inc = phase_inc;
                     self.cur_len = if (self.pi_loop_calculated & 1) == 1 {
+                        // TODO: I don't know what is the accurate formula for "pi" instrument
+                        // But I think this is incorrect
                         (1024.0 / phase_inc) as u32
                     } else {
                         (event.length as f32 * samples_per_beat) as u32
@@ -458,10 +461,11 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
         let right = ((self.cur_pan & 0b00001111) as i32 * vol) as f32 * MASTER_VOLUME;
         let mono = (((self.cur_pan >> 4) + (self.cur_pan & 0b00001111)) as i32 * vol) as f32
             * (MASTER_VOLUME / 2.0);
-        let n = if MONO {
-            cmp::min(buf.len(), self.cur_len as usize)
-        } else {
-            cmp::min(buf.len() / 2, self.cur_len as usize)
+        let n = match (DRUM, MONO) {
+            (true, true) => buf.len(),
+            (true, false) => buf.len() / 2,
+            (false, true) => cmp::min(buf.len(), self.cur_len as usize),
+            (false, false) => cmp::min(buf.len() / 2, self.cur_len as usize),
         };
         let inc = self.phase_inc;
         // Safety:
@@ -502,12 +506,19 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
             pos += val as u32 + inc_i;
             pos_sub -= val as f32;
             if pos >= len {
+                // Drums only play once.
+                if DRUM {
+                    self.cur_len = 0;
+                    break;
+                }
                 pos -= len;
             }
         }
         self.phase_acc = pos;
         self.phase_acc_sub = pos_sub;
-        self.cur_len -= n as u32;
+        if !DRUM {
+            self.cur_len -= n as u32;
+        }
     }
 }
 
