@@ -22,9 +22,13 @@ use is_terminal::IsTerminal;
 use orgorg::{CaveStoryAssetProvider, OrgPlay, OrgPlayBuilder, Soundbank};
 use self_cell::self_cell;
 
-use crate::pxt::synth_pxt;
+use crate::{
+    pxt::synth_pxt,
+    wdb::{OwnedSoundbank, from_soundbank_wdb},
+};
 
 mod pxt;
+mod wdb;
 
 /// A player for Organya Music.
 /// Requires soundbank.wdb, or original Doukutsu.exe from dou_1006.zip in the working directory
@@ -74,55 +78,32 @@ enum InterpModes {
     Lagrange,
 }
 
-// My API is painful for advanced uses. It needs self-referential structs.
-struct OwnedSoundbankImpl<'a>(&'a [u8; 25600], Vec<&'a [i8]>);
-self_cell!(
-    struct OwnedSoundbank {
-        owner: Vec<u8>,
-        #[covariant]
-        dependent: OwnedSoundbankImpl,
-    }
-);
+#[derive(Default)]
+struct PlayerControl {
+    paused: AtomicBool,
+    cur_beat: AtomicU32,
+    loop_start: AtomicU32,
+    loop_end: AtomicU32,
+    played_samples: AtomicU64,
+}
 
-impl OwnedSoundbank {
-    fn make_soundbank<'a>(&'a self) -> Soundbank<'a> {
-        Soundbank::new(
-            self.borrow_dependent().0,
-            self.borrow_dependent().1.as_slice(),
-        )
+struct AssetByDump([u8; 25600], [u8; 40000]);
+
+impl CaveStoryAssetProvider for &AssetByDump {
+    fn wavetable(&self) -> &[u8; 25600] {
+        &self.0
+    }
+
+    fn drum(&self) -> &[u8; 40000] {
+        &self.1
     }
 }
 
-fn from_soundbank_wdb(mut wdb: Vec<u8>) -> Option<OwnedSoundbank> {
-    fn fix_offset(wdb: &mut [u8]) -> Option<()> {
-        if wdb.len() < 25600 {
-            return None;
-        }
-        let mut offset = 25600;
-        while offset < wdb.len() {
-            let len = u32::from_le_bytes(wdb.get(offset..offset + 4)?.try_into().unwrap()) as usize;
-            let slice: &mut [i8] =
-                zerocopy::transmute_mut!(wdb.get_mut(offset + 4..offset + 4 + len)?);
-            slice
-                .iter_mut()
-                .for_each(|v| *v = v.wrapping_sub_unsigned(0x80));
-            offset += 4 + len;
-        }
-        Some(())
-    }
-    fix_offset(&mut wdb)?;
-    Some(OwnedSoundbank::new(wdb, |v| {
-        let wavetable = v[0..25600].try_into().unwrap();
-        let mut drums = vec![];
-        let mut offset = 25600;
-        while offset < v.len() {
-            let len = u32::from_le_bytes(v[offset..offset + 4].try_into().unwrap()) as usize;
-            let slice = &v[offset + 4..offset + 4 + len];
-            drums.push(zerocopy::transmute_ref!(slice));
-            offset += len + 4;
-        }
-        OwnedSoundbankImpl(wavetable, drums)
-    }))
+trait DynOrgPlay: Send {
+    fn synth_mono(&mut self, buf: &mut [f32]);
+    fn synth_stereo(&mut self, buf: &mut [f32]);
+    fn get_loop(&self) -> (u32, u32);
+    fn get_beat(&self) -> u32;
 }
 
 fn make_dyn_orgplay(
@@ -132,7 +113,6 @@ fn make_dyn_orgplay(
     sample_rate: u32,
 ) -> Result<Box<dyn DynOrgPlay>> {
     use orgorg::interp_impls;
-    // What a beautiful macro. Pretty clever isn't it?
     macro_rules! make {
         ($t:ident) => {{
             type _OrgPlay<'a> = OrgPlay<'a, interp_impls::$t, Soundbank<'a>>;
@@ -177,13 +157,6 @@ fn make_dyn_orgplay(
         InterpModes::None => make!(NoInterp),
     };
     Ok(i)
-}
-
-trait DynOrgPlay: Send {
-    fn synth_mono(&mut self, buf: &mut [f32]);
-    fn synth_stereo(&mut self, buf: &mut [f32]);
-    fn get_loop(&self) -> (u32, u32);
-    fn get_beat(&self) -> u32;
 }
 
 fn find_config(device: &Device, config: &AudioConfig) -> Result<StreamConfig> {
@@ -267,28 +240,6 @@ fn player(
     Ok(())
 }
 
-#[derive(Default)]
-struct PlayerControl {
-    paused: AtomicBool,
-    cur_beat: AtomicU32,
-    loop_start: AtomicU32,
-    loop_end: AtomicU32,
-    played_samples: AtomicU64,
-}
-
-#[derive(Debug)]
-struct AssetByDump([u8; 25600], [u8; 40000]);
-
-impl CaveStoryAssetProvider for &AssetByDump {
-    fn wavetable(&self) -> &[u8; 25600] {
-        &self.0
-    }
-
-    fn drum(&self) -> &[u8; 40000] {
-        &self.1
-    }
-}
-
 fn dump_and_synth(file: &Path) -> Result<AssetByDump> {
     // I know md5 is broken, but it should be okay for this purpose.
     const EXPECTED_MD5: [u8; 16] = [
@@ -345,7 +296,7 @@ fn to_soundbank(asset: AssetByDump) -> OwnedSoundbank {
             &[],
             &drums[36000..40000],
         ];
-        OwnedSoundbankImpl(wavetable.try_into().unwrap(), drums)
+        (wavetable.try_into().unwrap(), drums)
     })
 }
 
