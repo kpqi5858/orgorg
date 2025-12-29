@@ -32,47 +32,23 @@
 //! See orgorg-player for example.
 //!
 //! # How to get data needed for synthesis
-//! See orgorg-player project. Run `orgorg-player dump`.
+//! See [orgorg-player](https://github.com/kpqi5858/orgorg/tree/main/orgorg-player) project.
+//! Run `orgorg-player dump` for Cave Story wavetable and drums.
+//!
+//! And see [`wdb`](https://github.com/kpqi5858/orgorg/blob/main/orgorg-player/src/wdb.rs)
+//! module in orgorg-player for loading `soundbank.wdb`.
 //!
 //! # Performance
 //! It is fast and does not allocate memory at all. But with following caveats.
 //!
-//! FPU should be present for maximum performance,
-//! since there are lots of single-precision(f32) floating point arithmetic.
-//!
-//! This crate uses some unsafe to boost the performance.
-//! The author tried to ensure correctness but, who knows. Feel free to audit the code.
+//! - FPU should be present for maximum performance,
+//!   since there are lots of single-precision(f32) floating point arithmetic.
+//! - This crate uses some unsafe to boost the performance.
+//!   The author tried to ensure correctness but, who knows. Feel free to audit the code.
 
 use core::{cmp, marker::PhantomData, mem::MaybeUninit, ptr::NonNull};
 
 const MASTER_VOLUME: f32 = 1.0 / (1 << 19) as f32;
-
-// For more cleaner internal code. not for pub.
-trait U8SliceExt {
-    fn read_i16(&self, offset: usize) -> i16;
-    fn read_u16(&self, offset: usize) -> u16;
-    fn read_u32(&self, offset: usize) -> u32;
-    fn read_i8(&self, offset: usize) -> i8;
-}
-
-impl U8SliceExt for [u8] {
-    #[inline]
-    fn read_i16(&self, offset: usize) -> i16 {
-        i16::from_le_bytes(self[offset..offset + 2].try_into().unwrap())
-    }
-    #[inline]
-    fn read_u16(&self, offset: usize) -> u16 {
-        u16::from_le_bytes(self[offset..offset + 2].try_into().unwrap())
-    }
-    #[inline]
-    fn read_u32(&self, offset: usize) -> u32 {
-        u32::from_le_bytes(self[offset..offset + 4].try_into().unwrap())
-    }
-    #[inline]
-    fn read_i8(&self, offset: usize) -> i8 {
-        self[offset] as i8
-    }
-}
 
 /// Provides original Cave Story wavetable and drum samples to [`OrgPlay`].
 ///
@@ -240,7 +216,7 @@ pub mod interp_impls {
         #[inline(always)]
         unsafe fn interpolate(wave: &[i8], pos: u32, frac: f32) -> f32 {
             let len = wave.len();
-            // Safety: Caller guarantees that pos is finite, and 0 <= pos < wave.len().
+            // Safety: Caller guarantees that pos is finite, and pos < wave.len().
             unsafe {
                 let pos_idx = pos as usize;
                 let sample1 = *wave.get_unchecked(pos_idx);
@@ -258,7 +234,7 @@ pub mod interp_impls {
     impl OrgInterpolation for NoInterp {
         #[inline(always)]
         unsafe fn interpolate(wave: &[i8], pos: u32, _frac: f32) -> f32 {
-            // Safety: Caller guarantees that pos is finite, and 0 <= pos < wave.len().
+            // Safety: Caller guarantees that pos is finite, and pos < wave.len().
             unsafe { *wave.get_unchecked(pos as usize) as f32 }
         }
     }
@@ -269,7 +245,7 @@ pub mod interp_impls {
     impl OrgInterpolation for Lagrange {
         #[inline(always)]
         unsafe fn interpolate(wave: &[i8], pos: u32, frac: f32) -> f32 {
-            // Safety: Caller guarantees that pos is finite, and 0 <= pos < wave.len().
+            // Safety: Caller guarantees that pos is finite, and pos < wave.len().
             unsafe {
                 let len = wave.len();
                 let pos = pos as usize;
@@ -504,7 +480,7 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
             // SoundbankProvider never return invalid length array.
             // There is check in tick() method that ensures 0 <= phase_inc < len.
             // And at the end of this for loop, pos is wrapped.
-            // Therefore, 0 <= pos < len.
+            // Therefore, pos < len.
             let sample = unsafe {
                 debug_assert!(pos < len);
                 // Technically failing this assert does not cause UB, but just for correctness.
@@ -551,6 +527,27 @@ pub struct OrgPlay<'a, I: OrgInterpolation, A: SoundbankProvider> {
 
 impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
     fn new(asset: A, song: &'a [u8], rate: u32) -> Option<Self> {
+        trait U8SliceExt {
+            fn read_i16(&self, offset: usize) -> i16;
+            fn read_u16(&self, offset: usize) -> u16;
+            fn read_u32(&self, offset: usize) -> u32;
+        }
+
+        impl U8SliceExt for [u8] {
+            #[inline]
+            fn read_i16(&self, offset: usize) -> i16 {
+                i16::from_le_bytes(self[offset..offset + 2].try_into().unwrap())
+            }
+            #[inline]
+            fn read_u16(&self, offset: usize) -> u16 {
+                u16::from_le_bytes(self[offset..offset + 2].try_into().unwrap())
+            }
+            #[inline]
+            fn read_u32(&self, offset: usize) -> u32 {
+                u32::from_le_bytes(self[offset..offset + 4].try_into().unwrap())
+            }
+        }
+
         if song.len() < 114 {
             return None;
         }
@@ -582,7 +579,7 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
             let valid_wave = (0..100).contains(&wave);
 
             let n_events = song.read_u16(offset + 4);
-            let pi = if song.read_i8(offset + 3) != 0 { 1 } else { 0 };
+            let pi = if song[offset + 3] != 0 { 1 } else { 0 };
             let inst_data_ptr = if n_events == 0 {
                 NonNull::dangling()
             } else {
@@ -618,7 +615,7 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
             let wave = song[offset + 2];
             let valid_wave = asset.is_drum_valid(wave);
             let n_events = song.read_u16(offset + 4);
-            let pi = if song.read_i8(offset + 3) != 0 { 1 } else { 0 };
+            let pi = if song[offset + 3] != 0 { 1 } else { 0 };
             let inst_data_ptr = if n_events == 0 {
                 NonNull::dangling()
             } else {
