@@ -118,7 +118,7 @@ fn make_dyn_orgplay(
             type _OrgPlay<'a> = OrgPlay<'a, interp_impls::$t, Soundbank<'a>>;
             self_cell!(
                 struct _ImplDetail {
-                    owner: (Vec<u8>, OwnedSoundbank),
+                    owner: (Box<[u8]>, OwnedSoundbank),
                     #[covariant]
                     dependent: _OrgPlay,
                 }
@@ -140,14 +140,17 @@ fn make_dyn_orgplay(
                     self.with_dependent(|_, m| m.get_beat())
                 }
             }
-            Box::new(_ImplDetail::try_new((org, soundbank), |a| {
-                OrgPlayBuilder::new()
-                    .with_sample_rate(sample_rate)
-                    .with_soundbank_provider(a.1.make_soundbank())
-                    .with_interpolation(interp_impls::$t)
-                    .build(&a.0)
-                    .context("Invalid org music")
-            })?)
+            Box::new(_ImplDetail::try_new(
+                (org.into_boxed_slice(), soundbank),
+                |a| {
+                    OrgPlayBuilder::new()
+                        .with_sample_rate(sample_rate)
+                        .with_soundbank_provider(a.1.make_soundbank())
+                        .with_interpolation(interp_impls::$t)
+                        .build(&a.0)
+                        .context("Invalid org music")
+                },
+            )?)
         }};
     }
 
@@ -181,7 +184,7 @@ fn player_raw(
     mut write: impl Write,
 ) -> Result<()> {
     let mut player = make_dyn_orgplay(org, soundbank, config.interp, config.rate)?;
-    let mut buf = [0.0_f32; 4096];
+    let mut buf = vec![0.0_f32; 4096];
     loop {
         if config.mono {
             player.synth_mono(&mut buf);
@@ -279,13 +282,13 @@ fn dump_and_synth(file: &Path) -> Result<AssetByDump> {
 }
 
 fn to_soundbank(asset: AssetByDump) -> OwnedSoundbank {
-    let mut data = vec![];
+    let mut data = Vec::with_capacity(25600 + 40000);
     data.extend(asset.0);
     data.extend(asset.1);
-    OwnedSoundbank::new(data, |d| {
+    OwnedSoundbank::new(data.into_boxed_slice(), |d| {
         let (wavetable, drums) = d.split_at(25600);
         let drums: &[i8] = zerocopy::transmute_ref!(drums);
-        let drums = vec![
+        let drums = Box::new([
             &drums[0..5000],
             &[],
             &drums[5000..15000],
@@ -295,7 +298,7 @@ fn to_soundbank(asset: AssetByDump) -> OwnedSoundbank {
             &drums[26000..36000],
             &[],
             &drums[36000..40000],
-        ];
+        ]);
         (wavetable.try_into().unwrap(), drums)
     })
 }
