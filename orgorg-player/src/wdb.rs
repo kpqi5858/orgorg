@@ -1,7 +1,6 @@
 use orgorg::Soundbank;
 use self_cell::self_cell;
 
-// My API is painful for advanced uses. It needs self-referential structs.
 type OwnedSoundbankRef<'a> = (&'a [u8; 25600], Box<[&'a [i8]]>);
 
 self_cell!(
