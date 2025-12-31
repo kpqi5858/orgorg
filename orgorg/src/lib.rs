@@ -23,7 +23,7 @@
 //! let mut buffer = [0.0_f32; 1024];
 //! loop {
 //!     player.synth_stereo(&mut buffer);
-//!     // Do stuffs with buffer
+//!     // Process buffer and output
 //! }
 //! ```
 //!
