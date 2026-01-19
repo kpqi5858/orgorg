@@ -134,8 +134,7 @@ unsafe impl<T: CaveStoryAssetProvider> SoundbankProvider for T {
                 8 => (36000, 4000),
                 _ => core::hint::unreachable_unchecked(),
             };
-            let w = drums.get_unchecked(range.0..);
-            core::slice::from_raw_parts(w.as_ptr() as *const i8, range.1)
+            core::slice::from_raw_parts(drums.as_ptr().add(range.0) as *const i8, range.1)
         }
     }
 }
@@ -522,6 +521,38 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
     }
 }
 
+/// Playback option for [`OrgPlay`].
+#[derive(Default, Clone, Copy)]
+pub enum PlayTill {
+    /// Play endlessly.
+    #[default]
+    Endless,
+    /// Play until specified beat.
+    ///
+    /// If the specified beat is out of range for the song, it will behave like `Endless`.
+    Beat(u32),
+    /// Play until song loops.
+    Loop,
+}
+
+/// Result of [`OrgPlay`] playback, according to [`PlayTill`] option.
+pub struct PlayResult(bool, usize);
+
+impl PlayResult {
+    /// Returns `true` if the playback have reached the end.
+    pub fn reached_end(&self) -> bool {
+        self.0
+    }
+
+    /// If the playback have reached the end, length of filled samples in the buffer.
+    /// Rest of the buffer is filled with `0.0`.
+    ///
+    /// Else, this is always the full length of the buffer.
+    pub fn filled_length(&self) -> usize {
+        self.1
+    }
+}
+
 /// `no_std` compatible Cave Story Organya Music Player.
 pub struct OrgPlay<'a, I: OrgInterpolation, A: SoundbankProvider> {
     sample_rate: u32,
@@ -689,38 +720,68 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
         })
     }
 
-    /// Generates 1-channel mono audio data.
+    /// Advance song and generate 1-channel mono audio data.
     ///
     /// Values can exceed `[-1, 1]` range on some songs.
     pub fn synth_mono(&mut self, buf: &mut [f32]) {
-        self.synth_impl::<true>(buf);
+        self.synth_impl::<true>(buf, PlayTill::Endless);
     }
 
-    /// Generates stereo interleaved audio data.
+    /// Advance song and generate stereo interleaved audio data.
     ///
     /// Values can exceed `[-1, 1]` range on some songs.
     /// # Panics
     ///
     /// Panics if `buf.len()` is not multiple of 2.
     pub fn synth_stereo(&mut self, buf: &mut [f32]) {
-        self.synth_impl::<false>(buf);
+        self.synth_impl::<false>(buf, PlayTill::Endless);
     }
 
-    fn synth_impl<const MONO: bool>(&mut self, buf: &mut [f32]) {
+    /// Advance song and generate 1-channel mono audio data, till specified position.
+    ///
+    /// Values can exceed `[-1, 1]` range on some songs.
+    pub fn synth_mono_till(&mut self, buf: &mut [f32], till: PlayTill) -> PlayResult {
+        self.synth_impl::<true>(buf, till)
+    }
+
+    /// Advance song and generate stereo interleaved audio data, till specified position.
+    ///
+    /// Values can exceed `[-1, 1]` range on some songs.
+    /// # Panics
+    ///
+    /// Panics if `buf.len()` is not multiple of 2.
+    pub fn synth_stereo_till(&mut self, buf: &mut [f32], till: PlayTill) -> PlayResult {
+        self.synth_impl::<false>(buf, till)
+    }
+
+    fn synth_impl<const MONO: bool>(&mut self, buf: &mut [f32], till: PlayTill) -> PlayResult {
         if !MONO {
             assert!(buf.len().is_multiple_of(2));
         }
+        // Just in case if user wants to play till loop_end, which is equivalent to PlayTill::Loop.
+        let till = if let PlayTill::Beat(b) = till
+            && b == self.loop_end
+        {
+            PlayTill::Loop
+        } else {
+            till
+        };
+
         buf.fill(0.0);
         let mut filled_raw = 0;
         while filled_raw < buf.len() {
             if self.remaining_samples <= 0.0 {
                 self.remaining_samples += self.samples_per_beat;
                 self.cur_beat += 1;
+                let looped;
                 if self.cur_beat >= self.loop_end {
                     self.cur_beat = self.loop_start;
+                    looped = true;
+                } else {
+                    looped = false;
                 }
                 // Since they don't change, making and passing a reference to the tuple is
-                // slightly faster than 4 individual arguments.
+                // slightly faster than passing individual arguments.
                 let tick_args = &(
                     self.cur_beat,
                     self.loop_start,
@@ -733,6 +794,19 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
                 }
                 for w in &mut self.drum_ins {
                     w.tick(tick_args);
+                }
+                match till {
+                    PlayTill::Endless => {}
+                    PlayTill::Loop => {
+                        if looped {
+                            return PlayResult(true, filled_raw);
+                        }
+                    }
+                    PlayTill::Beat(b) => {
+                        if self.cur_beat == b {
+                            return PlayResult(true, filled_raw);
+                        }
+                    }
                 }
             }
             debug_assert!(self.remaining_samples > 0.0);
@@ -772,6 +846,7 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
                 self.remaining_samples -= (to_fill_raw / 2) as f32;
             }
         }
+        PlayResult(false, buf.len())
         // Multiplying MASTER_VOLUME in fill_buf is somewhat faster
         // buf.iter_mut().for_each(|f| *f *= MASTER_VOLUME);
     }
@@ -786,7 +861,6 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
         self.cur_beat
     }
 
-    // TODO: Play till function
     // TODO: Seek function (Will be expensive)
 }
 
