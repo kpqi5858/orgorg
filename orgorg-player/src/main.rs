@@ -8,6 +8,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        mpsc,
     },
     time::Duration,
 };
@@ -19,7 +20,7 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
 use is_terminal::IsTerminal;
-use orgorg::{CaveStoryAssetProvider, OrgPlay, OrgPlayBuilder, Soundbank};
+use orgorg::{CaveStoryAssetProvider, OrgPlay, OrgPlayBuilder, PlayResult, PlayTill, Soundbank};
 use self_cell::self_cell;
 
 use crate::{
@@ -57,6 +58,9 @@ struct AudioConfig {
     /// Interpolation to use
     #[arg(long, short, value_enum, default_value = "lagrange")]
     interp: InterpModes,
+    /// How many loops to play
+    #[arg(long, short)]
+    loops: Option<u32>,
 }
 
 #[derive(Subcommand)]
@@ -100,8 +104,8 @@ impl CaveStoryAssetProvider for &AssetByDump {
 }
 
 trait DynOrgPlay: Send {
-    fn synth_mono(&mut self, buf: &mut [f32]);
-    fn synth_stereo(&mut self, buf: &mut [f32]);
+    fn synth_mono_till(&mut self, buf: &mut [f32], till: PlayTill) -> PlayResult;
+    fn synth_stereo_till(&mut self, buf: &mut [f32], till: PlayTill) -> PlayResult;
     fn get_loop(&self) -> (u32, u32);
     fn get_beat(&self) -> u32;
 }
@@ -124,12 +128,12 @@ fn make_dyn_orgplay(
                 }
             );
             impl DynOrgPlay for _ImplDetail {
-                fn synth_mono(&mut self, buf: &mut [f32]) {
-                    self.with_dependent_mut(|_, m| m.synth_mono(buf));
+                fn synth_mono_till(&mut self, buf: &mut [f32], till: PlayTill) -> PlayResult {
+                    self.with_dependent_mut(|_, m| m.synth_mono_till(buf, till))
                 }
 
-                fn synth_stereo(&mut self, buf: &mut [f32]) {
-                    self.with_dependent_mut(|_, m| m.synth_stereo(buf));
+                fn synth_stereo_till(&mut self, buf: &mut [f32], till: PlayTill) -> PlayResult {
+                    self.with_dependent_mut(|_, m| m.synth_stereo_till(buf, till))
                 }
 
                 fn get_loop(&self) -> (u32, u32) {
@@ -177,6 +181,36 @@ fn find_config(device: &Device, config: &AudioConfig) -> Result<StreamConfig> {
     anyhow::bail!("Cannot find suitable audio output config")
 }
 
+fn handle_synthesis(
+    player: &mut dyn DynOrgPlay,
+    mut buf: &mut [f32],
+    mono: bool,
+    loops: &mut Option<u32>,
+) -> Option<usize> {
+    let till = match loops {
+        Some(_) => PlayTill::Loop,
+        None => PlayTill::Endless,
+    };
+    let original_len = buf.len();
+    while !buf.is_empty() {
+        let res = if mono {
+            player.synth_mono_till(buf, till)
+        } else {
+            player.synth_stereo_till(buf, till)
+        };
+        buf = &mut buf[res.filled_length()..];
+        if res.reached_end() {
+            let loops = loops.as_mut().unwrap();
+            if *loops == 0 {
+                return Some(original_len - buf.len());
+            }
+            *loops -= 1;
+        }
+    }
+
+    None
+}
+
 fn player_raw(
     config: &AudioConfig,
     soundbank: OwnedSoundbank,
@@ -185,13 +219,13 @@ fn player_raw(
 ) -> Result<()> {
     let mut player = make_dyn_orgplay(org, soundbank, config.interp, config.rate)?;
     let mut buf = vec![0.0_f32; 4096];
+    let mut loops = config.loops;
     loop {
-        if config.mono {
-            player.synth_mono(&mut buf);
-        } else {
-            player.synth_stereo(&mut buf);
+        let res = handle_synthesis(&mut *player, &mut buf, config.mono, &mut loops);
+        write.write_all(zerocopy::transmute_ref!(&buf[..res.unwrap_or(buf.len())]))?;
+        if res.is_some() {
+            return Ok(());
         }
-        write.write_all(zerocopy::transmute_ref!(buf.as_slice()))?;
     }
 }
 
@@ -200,9 +234,11 @@ fn player(
     soundbank: OwnedSoundbank,
     config: StreamConfig,
     interp: InterpModes,
+    mut loops: Option<u32>,
     org: Vec<u8>,
     control: Arc<PlayerControl>,
-    exit: oneshot::Receiver<()>,
+    exit_send: mpsc::Sender<()>,
+    exit_recv: mpsc::Receiver<()>,
 ) -> Result<()> {
     let channels = config.channels;
 
@@ -220,13 +256,13 @@ fn player(
             }
             // Usually synthesis inside audio thread is bad idea.
             // But my player is very fast so not big of deal.
-            match channels {
-                1 => player.synth_mono(data),
-                2 => player.synth_stereo(data),
-                _ => unreachable!(),
+            let res = handle_synthesis(&mut *player, data, channels == 1, &mut loops);
+            if res.is_some() {
+                ctrl.paused.store(true, Ordering::Relaxed);
+                exit_send.send(()).unwrap();
             }
             ctrl.played_samples
-                .fetch_add(data.len() as u64, Ordering::Relaxed);
+                .fetch_add(res.unwrap_or(data.len()) as u64, Ordering::Relaxed);
             ctrl.cur_beat.store(player.get_beat(), Ordering::Relaxed);
         },
         |err| {
@@ -236,8 +272,7 @@ fn player(
     )?;
     stream.play()?;
 
-    // Don't care, received message either sender is dropped
-    let _ = exit.recv();
+    let _ = exit_recv.recv();
     // Be explicit
     drop(stream);
     Ok(())
@@ -370,12 +405,13 @@ fn main() -> Result<()> {
                 return player_raw(&config, soundbank, org, stdout);
             }
 
+            let loops = config.loops;
             let interp = config.interp;
             let channels = if config.mono { 1 } else { 2 };
             let rate = config.rate;
             let control: Arc<PlayerControl> = Arc::default();
             let control_clone = control.clone();
-            let (_exit, exit_receiver) = oneshot::channel();
+            let (exit_send, exit_recv) = mpsc::channel();
 
             let device = cpal::default_host()
                 .default_output_device()
@@ -388,9 +424,11 @@ fn main() -> Result<()> {
                     soundbank,
                     config,
                     interp,
+                    loops,
                     org,
                     control_clone,
-                    exit_receiver,
+                    exit_send,
+                    exit_recv,
                 )
             });
 
