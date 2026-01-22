@@ -107,6 +107,17 @@ pub unsafe trait SoundbankProvider {
     /// Caller must not call this function
     /// if [`SoundbankProvider::is_drum_valid`] with given `idx` would return `false`.
     unsafe fn get_drum(&self, idx: u8) -> &[i8];
+
+    /// Get drum sample of `idx`, returning `None` if invalid.
+    #[inline]
+    fn get_drum_checked(&self, idx: u8) -> Option<&[i8]> {
+        if self.is_drum_valid(idx) {
+            // Safety: Just checked it's valid
+            Some(unsafe { self.get_drum(idx) })
+        } else {
+            None
+        }
+    }
 }
 
 // Safety: All function is consistent.
@@ -123,7 +134,7 @@ unsafe impl<T: CaveStoryAssetProvider> SoundbankProvider for T {
 
     #[inline(always)]
     unsafe fn get_drum(&self, idx: u8) -> &[i8] {
-        let drums = CaveStoryAssetProvider::drum(self);
+        let drums = CaveStoryAssetProvider::drum(self).as_ptr();
         unsafe {
             let range = match idx {
                 0 => (0, 5000),
@@ -134,7 +145,7 @@ unsafe impl<T: CaveStoryAssetProvider> SoundbankProvider for T {
                 8 => (36000, 4000),
                 _ => core::hint::unreachable_unchecked(),
             };
-            core::slice::from_raw_parts(drums.as_ptr().add(range.0) as *const i8, range.1)
+            core::slice::from_raw_parts(drums.add(range.0).cast(), range.1)
         }
     }
 }
@@ -215,7 +226,7 @@ pub mod interp_impls {
         #[inline(always)]
         unsafe fn interpolate(wave: &[i8], pos: u32, frac: f32) -> f32 {
             let len = wave.len();
-            // Safety: Caller guarantees that pos is finite, and pos < wave.len().
+            // Safety: Caller upholds.
             unsafe {
                 let pos_idx = pos as usize;
                 let sample1 = *wave.get_unchecked(pos_idx);
@@ -233,7 +244,7 @@ pub mod interp_impls {
     impl OrgInterpolation for NoInterp {
         #[inline(always)]
         unsafe fn interpolate(wave: &[i8], pos: u32, _frac: f32) -> f32 {
-            // Safety: Caller guarantees that pos is finite, and pos < wave.len().
+            // Safety: Caller upholds.
             unsafe { *wave.get_unchecked(pos as usize) as f32 }
         }
     }
@@ -244,7 +255,7 @@ pub mod interp_impls {
     impl OrgInterpolation for Lagrange {
         #[inline(always)]
         unsafe fn interpolate(wave: &[i8], pos: u32, frac: f32) -> f32 {
-            // Safety: Caller guarantees that pos is finite, and pos < wave.len().
+            // Safety: Caller upholds.
             unsafe {
                 let len = wave.len();
                 let pos = pos as usize;
@@ -281,27 +292,27 @@ struct Event {
 }
 
 struct Instrument<'a, I: OrgInterpolation, const DRUM: bool> {
-    // Must be:
+    // Invariants:
     // - If n_events is 0, this pointer can be dangling so never access it
     // - else, this is a start of &'a [u8] with length of n_events * 8
     // Raw pointer to save a usize space over slice here.
     inst_data_ptr: NonNull<u8>,
     tuning: i16,
-    // loop_event: Option<i16> is ergonomic but this saves space
-    pi_loop_calculated: u8,
+    pi: bool,
     // Supposedly the maximum number of events in a single instrument is 256.
     // Some incompatible(non-standard?) music can exceed that arbitrary limit.
     // So, be lenient here.
     n_events: u16,
     cur_event: u16,
     // TODO: Pre-calculate this value, not on the fly
-    loop_event: u16,
+    loop_event: Option<u16>,
     phase_inc: f32,
     phase_acc: u32,
     phase_acc_sub: f32,
     cur_pan: u8,
     cur_vol: u8,
-    // if n_events != 0, must point to valid wave
+    // Invariants:
+    // - If n_events != 0, must point to valid wave
     wave_idx: u8,
     cur_len: u32,
     _i: PhantomData<I>,
@@ -360,11 +371,10 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
         // Unofficial reference
         // https://gist.github.com/fdeitylink/7fc9ddcc54b33971e5f505c8da2cfd28
         if cur_beat == loop_start {
-            if self.pi_loop_calculated & 2 == 2 {
-                self.cur_event = self.loop_event;
+            if let Some(loop_event) = self.loop_event {
+                self.cur_event = loop_event;
             } else {
-                self.loop_event = self.cur_event;
-                self.pi_loop_calculated |= 2;
+                self.loop_event = Some(self.cur_event);
             }
         }
         if self.cur_event >= self.n_events {
@@ -417,7 +427,7 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
                 let in_pitch = phase_inc.is_finite() && (0.0..256.0).contains(&phase_inc);
                 if in_pitch {
                     self.phase_inc = phase_inc;
-                    self.cur_len = if (self.pi_loop_calculated & 1) == 1 {
+                    self.cur_len = if self.pi {
                         // TODO: I don't know what is the accurate formula for "pi" instrument
                         // But I think this is incorrect
                         (1024.0 / phase_inc) as u32
@@ -444,15 +454,11 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
             } else {
                 debug_assert!((0..100).contains(&self.wave_idx));
                 let idx = self.wave_idx as usize * 256;
-                let w: &[u8; 256] = a
-                    .wavetable()
-                    .get_unchecked(idx..idx + 256)
-                    .try_into()
-                    .unwrap_unchecked();
-                let w = w as *const [u8; 256] as *const [i8; 256];
-                &*w
+                let w = a.wavetable().as_ptr();
+                core::slice::from_raw_parts(w.add(idx).cast(), 256)
             }
         };
+        debug_assert!((16..=500000).contains(&cur_wave.len()));
         let len = cur_wave.len() as u32;
         let vol = self.cur_vol as i32;
         // Integer multiplication then float cast is slightly faster
@@ -621,7 +627,7 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
             let valid_wave = (0..100).contains(&wave);
 
             let n_events = song.read_u16(offset + 4);
-            let pi = if song[offset + 3] != 0 { 1 } else { 0 };
+            let pi = song[offset + 3] != 0;
             let inst_data_ptr = if n_events == 0 {
                 NonNull::dangling()
             } else {
@@ -633,7 +639,7 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
             let mut ret = Instrument {
                 inst_data_ptr,
                 tuning: song.read_i16(offset),
-                pi_loop_calculated: pi,
+                pi,
                 n_events: if valid_wave { n_events } else { 0 }, // Must be 0 for invalid wave
                 phase_inc: 0.0,
                 phase_acc: 0,
@@ -642,7 +648,7 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
                 cur_vol: 0,
                 cur_len: 0,
                 cur_event: 0,
-                loop_event: 0,
+                loop_event: None,
                 wave_idx: wave,
                 _i: PhantomData,
                 _a: PhantomData,
@@ -657,7 +663,7 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
             let wave = song[offset + 2];
             let valid_wave = asset.is_drum_valid(wave);
             let n_events = song.read_u16(offset + 4);
-            let pi = if song[offset + 3] != 0 { 1 } else { 0 };
+            let pi = song[offset + 3] != 0;
             let inst_data_ptr = if n_events == 0 {
                 NonNull::dangling()
             } else {
@@ -669,7 +675,7 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
             let mut ret = Instrument {
                 inst_data_ptr,
                 tuning: song.read_i16(offset),
-                pi_loop_calculated: pi,
+                pi,
                 n_events: if valid_wave { n_events } else { 0 }, // Must be 0 for invalid wave
                 phase_inc: 0.0,
                 phase_acc: 0,
@@ -678,7 +684,7 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
                 cur_vol: 0,
                 cur_len: 0,
                 cur_event: 0,
-                loop_event: 0,
+                loop_event: None,
                 wave_idx: wave,
                 _i: PhantomData,
                 _a: PhantomData,
