@@ -45,6 +45,8 @@
 //!   since there are lots of single-precision(f32) floating point arithmetic.
 //! - This crate uses some unsafe to boost the performance.
 //!   The author tried to ensure correctness but, who knows. Feel free to audit the code.
+//! - As you might guessed from generic `OrgPlay` type,
+//!   constructing many variants of `OrgPlay` may lead to size bloat.
 
 use core::{cmp, marker::PhantomData, mem::MaybeUninit, ptr::NonNull};
 
