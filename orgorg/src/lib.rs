@@ -57,10 +57,11 @@
 //! It is programmed to take maximum advantage of LLVM's auto-vectorization thus
 //! extremely fast on modern platforms. Plus it is optimized for embedded usage:
 //!
-//! - Does not perform any dynamic memory allocation at all.
+//! - No dynamic memory allocation. Does not require `alloc`.
 //! - No integer division.
 //! - No `f64` arithmetic.
 //! - No 64-bit arithmetic on 32-bit platform.
+//! - Whole player state can be as small as 408 bytes + one pointer width.
 //!
 //! But with following caveats.
 //!
@@ -412,15 +413,14 @@ struct Event {
 }
 
 struct Instrument<const DRUM: bool> {
-    tuning: u16,
+    tuning: i16,
     pi: bool,
     // Supposedly the maximum number of events in a single instrument is 256.
     // Some incompatible(non-standard?) music can exceed that arbitrary limit.
     // So, be lenient here.
     n_events: u16,
     cur_event: u16,
-    // TODO: Pre-calculate this value, not on the fly
-    loop_event: Option<u16>,
+    loop_event: u16,
     phase_inc: u32,
     phase_acc: u32,
     cur_pan: u8,
@@ -469,6 +469,23 @@ impl<const DRUM: bool> Instrument<DRUM> {
         }
     }
 
+    fn calculate_loop(&mut self, loop_start: u32, ptr: NonNull<u8>) {
+        self.cur_event = 0;
+        loop {
+            if self.cur_event >= self.n_events {
+                self.loop_event = self.n_events.saturating_sub(1);
+                break;
+            }
+            let cur_beat = unsafe { self.get_cur_event_beat(ptr) };
+            if cur_beat >= loop_start {
+                self.loop_event = self.cur_event;
+                break;
+            }
+            self.cur_event += 1;
+        }
+        self.cur_event = 0;
+    }
+
     fn tick(&mut self, cur_beat: u32, loop_start: u32, rate: u32, ptr: NonNull<u8>) {
         // There is no official documentation for .org file,
         // and these logics are not designed to handle it as leniently as possible.
@@ -478,11 +495,7 @@ impl<const DRUM: bool> Instrument<DRUM> {
         // Unofficial reference
         // https://gist.github.com/fdeitylink/7fc9ddcc54b33971e5f505c8da2cfd28
         if cur_beat == loop_start {
-            if let Some(loop_event) = self.loop_event {
-                self.cur_event = loop_event;
-            } else {
-                self.loop_event = Some(self.cur_event);
-            }
+            self.cur_event = self.loop_event;
         }
         if !DRUM && !self.pi {
             self.cur_len_or_phase_acc = self.cur_len_or_phase_acc.saturating_sub(1);
@@ -537,17 +550,17 @@ impl<const DRUM: bool> Instrument<DRUM> {
                     self.phase_inc = inc;
                 }
             } else {
-                const FRQ_TABLE: [u32; 12] =
+                const FRQ_TABLE: [i32; 12] =
                     [262, 277, 294, 311, 330, 349, 370, 392, 415, 440, 466, 494];
                 let freq = FRQ_TABLE[(event.note % 12) as usize];
                 let oct = 1 << (5 + (event.note / 12).min(7) as i32);
-                let final_freq = (freq * oct) + (self.tuning as u32 - 1000);
-                let phase_inc = calc_inc(final_freq, rate);
+                let final_freq = (freq * oct) + (self.tuning - 1000) as i32;
+                let phase_inc = calc_inc(final_freq as u32, rate);
                 if let Some(inc) = phase_inc {
                     self.phase_inc = inc;
                     self.cur_len_or_phase_acc = if self.pi {
                         // TODO: I dont know what is the accurate formula for pi instrument
-                        (oct + 1) * 4 * 256
+                        (oct as u32 + 1) * 4 * 256
                     } else {
                         event.length as u32
                     };
@@ -720,6 +733,10 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
                 self.read::<1>(offset)[0]
             }
 
+            fn read_i16(&self, offset: usize) -> i16 {
+                i16::from_le_bytes(self.read(offset))
+            }
+
             fn read_u16(&self, offset: usize) -> u16 {
                 u16::from_le_bytes(self.read(offset))
             }
@@ -774,7 +791,7 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
                 unsafe { NonNull::new_unchecked(inst_data.as_ptr() as *mut u8) }
             };
             let mut ret = Instrument {
-                tuning: song_reader.read_u16(offset),
+                tuning: song_reader.read_i16(offset),
                 pi,
                 n_events: if valid_wave { n_events } else { 0 }, // Must be 0 for invalid wave
                 phase_inc: 0,
@@ -783,9 +800,10 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
                 cur_vol: 0,
                 cur_len_or_phase_acc: 0,
                 cur_event: 0,
-                loop_event: None,
+                loop_event: 0,
                 wave_idx: wave,
             };
+            ret.calculate_loop(loop_start, inst_data_ptr);
             // Initial ticking for beat 0, since synth function will start ticking at beat 1
             ret.tick(0, loop_start, rate, inst_data_ptr);
             offset += 6;
@@ -806,7 +824,7 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
                 unsafe { NonNull::new_unchecked(inst_data.as_ptr() as *mut u8) }
             };
             let mut ret = Instrument {
-                tuning: song_reader.read_u16(offset),
+                tuning: song_reader.read_i16(offset),
                 pi,
                 n_events: if valid_wave { n_events } else { 0 }, // Must be 0 for invalid wave
                 phase_inc: 0,
@@ -815,9 +833,10 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
                 cur_vol: 0,
                 cur_len_or_phase_acc: 0,
                 cur_event: 0,
-                loop_event: None,
+                loop_event: 0,
                 wave_idx: wave,
             };
+            ret.calculate_loop(loop_start, inst_data_ptr);
             // Initial ticking for beat 0, since synth function will start ticking at beat 1
             ret.tick(0, loop_start, rate, inst_data_ptr);
             offset += 6;
