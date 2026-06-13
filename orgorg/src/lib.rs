@@ -499,6 +499,11 @@ struct Event {
     panning: u8,
 }
 
+#[cfg(feature = "simd")]
+type AccTy = u32;
+#[cfg(not(feature = "simd"))]
+type AccTy = f32;
+
 struct Instrument<'a, I: OrgInterpolation, const DRUM: bool> {
     // Invariants:
     // - If n_events is 0, this pointer can be dangling so never access it
@@ -514,18 +519,16 @@ struct Instrument<'a, I: OrgInterpolation, const DRUM: bool> {
     cur_event: u16,
     // TODO: Pre-calculate this value, not on the fly
     loop_event: Option<u16>,
-    phase_inc: f32,
+    phase_inc: AccTy,
     // In `simd` and non-DRUM, this is 8.24 phase accumulator. phase_acc_sub is not used.
     phase_acc: u32,
-    #[cfg(feature = "simd")]
-    phase_acc_sub: u32,
-    #[cfg(not(feature = "simd"))]
-    phase_acc_sub: f32,
+    phase_acc_sub: AccTy,
     cur_pan: u8,
     cur_vol: u8,
     // Invariants:
     // - If n_events != 0, must point to valid wave
     wave_idx: u8,
+    // DRUM: 8. part
     cur_len: u32,
     _i: PhantomData<I>,
     _a: PhantomData<&'a [u8]>,
@@ -533,6 +536,19 @@ struct Instrument<'a, I: OrgInterpolation, const DRUM: bool> {
 
 unsafe impl<'a, I: OrgInterpolation, const DRUM: bool> Send for Instrument<'a, I, DRUM> {}
 unsafe impl<'a, I: OrgInterpolation, const DRUM: bool> Sync for Instrument<'a, I, DRUM> {}
+
+#[cfg(feature = "simd")]
+mod _simd {
+    // 8.24 fixed point arithmetic
+    pub const I24: u32 = 0x1000000;
+    pub const I24MASK: u32 = I24 - 1;
+    pub const F24: f32 = I24 as f32;
+
+    #[cold]
+    pub fn cold_path() {}
+}
+#[cfg(feature = "simd")]
+use _simd::{F24, I24MASK, cold_path};
 
 impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
     // Safety: cur_event < n_events
@@ -612,7 +628,7 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
         }
         if event.note != 255 {
             self.phase_acc = 0;
-            self.phase_acc_sub = 0;
+            self.phase_acc_sub = AccTy::default();
             self.cur_len = 0;
             let rate = *rate as f32;
             if DRUM {
@@ -623,9 +639,19 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
                 // And if this condition is false, then the pitch isn't in RATE at all.
                 let in_pitch = phase_inc.is_finite() && (0.0..wave_len as f32).contains(&phase_inc);
                 if in_pitch {
-                    self.phase_inc = phase_inc;
-                    // Length logic will be handled in fill_buf
-                    self.cur_len = 1;
+                    #[cfg(feature = "simd")]
+                    unsafe {
+                        let i = phase_inc.to_int_unchecked::<i32>();
+                        let i_sub = phase_inc - i as f32;
+                        self.cur_len = i as u32;
+                        self.phase_inc = (i_sub * F24).to_int_unchecked::<i32>() as u32;
+                    }
+                    #[cfg(not(feature = "simd"))]
+                    {
+                        self.phase_inc = phase_inc;
+                        // Length logic will be handled in fill_buf
+                        self.cur_len = 1;
+                    }
                 }
             } else {
                 const FRQ_TABLE: [i32; 12] =
@@ -638,7 +664,17 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
                 // And if this condition is false, then the pitch isn't in RATE at all.
                 let in_pitch = phase_inc.is_finite() && (0.0..256.0).contains(&phase_inc);
                 if in_pitch {
-                    self.phase_inc = phase_inc;
+                    #[cfg(feature = "simd")]
+                    unsafe {
+                        let i = phase_inc.to_int_unchecked::<i32>();
+                        let i_sub = phase_inc - i as f32;
+                        let v = (i << 24) | (i_sub * F24).to_int_unchecked::<i32>();
+                        self.phase_inc = v as u32;
+                    };
+                    #[cfg(not(feature = "simd"))]
+                    {
+                        self.phase_inc = phase_inc;
+                    }
                     self.cur_len = if self.pi {
                         // TODO: I don't know what is the accurate formula for "pi" instrument
                         // But I think this is incorrect
@@ -653,6 +689,15 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
 
     // This function is the critical part of overall performance.
     fn fill_buf<A: SoundbankProvider, const MONO: bool>(&mut self, buf: &mut [f32], a: &A) {
+        #[cfg(feature = "simd")]
+        if !DRUM && self.cur_len == 0 {
+            return;
+        }
+        #[cfg(feature = "simd")]
+        if DRUM && self.cur_len | self.phase_inc == 0 {
+            return;
+        }
+        #[cfg(not(feature = "simd"))]
         if self.cur_len == 0 {
             return;
         }
@@ -680,36 +725,21 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
             (false, true) => cmp::min(buf.len(), self.cur_len as usize),
             (false, false) => cmp::min(buf.len() / 2, self.cur_len as usize),
         };
-        let inc = self.phase_inc;
-        // Safety:
-        // There is check in tick() method that ensures 0 <= phase_inc < len.
-        let inc_i = unsafe {
-            let i = self.phase_inc.to_int_unchecked::<i32>();
-            // Saves an instruction needed for sign extension.
-            core::hint::assert_unchecked(i >= 0);
-            i as u32
-        };
-
-        let inc_sub = inc - inc_i as f32;
-
-        let mut pos = Wrapping(self.phase_acc);
-        let mut pos_sub = self.phase_acc_sub;
-
         #[cfg(feature = "simd")]
         {
             use wide::{f32x8, i32x8, u32x8};
+
+            let mut pos = Wrapping(self.phase_acc);
+            let mut pos_sub = self.phase_acc_sub;
 
             // Usually remainder seems to be processed in scalar, but it was slower in my benchmark.
             let simd_path_cnt = n.div_ceil(8);
             let simd_path_rem = n % 8;
 
             unsafe {
-                // 8.24 fixed point arithmetic
-                const I24: u32 = 0x1000000;
-                const I24MASK: u32 = I24 - 1;
-                const F24: f32 = I24 as f32;
-                let wave_inc = (inc_i << 24) | (inc_sub * F24).to_int_unchecked::<i32>() as u32;
-                let inc_sub_24 = (inc_sub * F24).to_int_unchecked::<i32>() as u32;
+                let inc_i = self.cur_len;
+                let wave_inc = self.phase_inc;
+                let inc_sub_24 = self.phase_inc;
 
                 for i in 0..simd_path_cnt {
                     let result = if !DRUM {
@@ -747,6 +777,8 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
                         let sub_frac = sub_pos_f.round_float() / f32x8::splat(F24);
 
                         if i == simd_path_cnt - 1 && simd_path_rem != 0 {
+                            // This *does* improves codegen.
+                            cold_path();
                             pos_sub = sub_pos_f.to_array()[simd_path_rem] as u32;
                             pos = Wrapping(base_pos.to_array()[simd_path_rem]);
                         } else {
@@ -816,14 +848,38 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
                     }
 
                     if DRUM && pos.0 >= cur_wave.len() as u32 + I::INTERP_REMNANT {
+                        // Not sure about this one.
+                        cold_path();
                         self.cur_len = 0;
+                        self.phase_inc = 0;
                         return;
                     }
+                }
+
+                self.phase_acc = pos.0;
+                self.phase_acc_sub = pos_sub;
+                if !DRUM {
+                    self.cur_len -= n as u32;
                 }
             }
         }
         #[cfg(not(feature = "simd"))]
         {
+            let inc = self.phase_inc;
+            // Safety:
+            // There is check in tick() method that ensures 0 <= phase_inc < len.
+            let inc_i = unsafe {
+                let i = self.phase_inc.to_int_unchecked::<i32>();
+                // Saves an instruction needed for sign extension.
+                core::hint::assert_unchecked(i >= 0);
+                i as u32
+            };
+
+            let inc_sub = inc - inc_i as f32;
+
+            let mut pos = Wrapping(self.phase_acc);
+            let mut pos_sub = self.phase_acc_sub;
+
             for i in 0..n {
                 // Technically failing this assert does not cause UB, but just for correctness.
                 debug_assert!((0.0..1.0).contains(&pos_sub));
@@ -854,12 +910,11 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
                     return;
                 }
             }
-        }
-
-        self.phase_acc = pos.0;
-        self.phase_acc_sub = pos_sub;
-        if !DRUM {
-            self.cur_len -= n as u32;
+            self.phase_acc = pos.0;
+            self.phase_acc_sub = pos_sub;
+            if !DRUM {
+                self.cur_len -= n as u32;
+            }
         }
     }
 }
@@ -978,9 +1033,9 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
                 tuning: song.read_i16(offset),
                 pi,
                 n_events: if valid_wave { n_events } else { 0 }, // Must be 0 for invalid wave
-                phase_inc: 0.0,
+                phase_inc: AccTy::default(),
                 phase_acc: 0,
-                phase_acc_sub: Default::default(),
+                phase_acc_sub: AccTy::default(),
                 cur_pan: 0,
                 cur_vol: 0,
                 cur_len: 0,
@@ -1014,9 +1069,9 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
                 tuning: song.read_i16(offset),
                 pi,
                 n_events: if valid_wave { n_events } else { 0 }, // Must be 0 for invalid wave
-                phase_inc: 0.0,
+                phase_inc: AccTy::default(),
                 phase_acc: 0,
-                phase_acc_sub: Default::default(),
+                phase_acc_sub: AccTy::default(),
                 cur_pan: 0,
                 cur_vol: 0,
                 cur_len: 0,
