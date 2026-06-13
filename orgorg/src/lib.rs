@@ -517,6 +517,9 @@ struct Instrument<'a, I: OrgInterpolation, const DRUM: bool> {
     phase_inc: f32,
     // In `simd` and non-DRUM, this is 8.24 phase accumulator. phase_acc_sub is not used.
     phase_acc: u32,
+    #[cfg(feature = "simd")]
+    phase_acc_sub: u32,
+    #[cfg(not(feature = "simd"))]
     phase_acc_sub: f32,
     cur_pan: u8,
     cur_vol: u8,
@@ -609,7 +612,7 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
         }
         if event.note != 255 {
             self.phase_acc = 0;
-            self.phase_acc_sub = 0.0;
+            self.phase_acc_sub = 0;
             self.cur_len = 0;
             let rate = *rate as f32;
             if DRUM {
@@ -699,15 +702,21 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
             // Usually remainder seems to be processed in scalar, but it was slower in my benchmark.
             let simd_path_cnt = n.div_ceil(8);
             let simd_path_rem = n % 8;
+
             unsafe {
-                // 8.24 fixed point arithmetic for wave channels
+                // 8.24 fixed point arithmetic
                 const I24: u32 = 0x1000000;
                 const I24MASK: u32 = I24 - 1;
                 const F24: f32 = I24 as f32;
                 let wave_inc = (inc_i << 24) | (inc_sub * F24).to_int_unchecked::<i32>() as u32;
+                let inc_sub_24 = (inc_sub * F24).to_int_unchecked::<i32>() as u32;
 
                 for i in 0..simd_path_cnt {
                     let result = if !DRUM {
+                        // This compiles to (in my machine):
+                        // - 2x loop unroll
+                        // - simd_path_rem == 0 path
+                        // - simd_path_rem != 0 path
                         let lane: u32x8 = [0, 1, 2, 3, 4, 5, 6, 7].into();
                         let base_pos_fp = lane * u32x8::splat(wave_inc) + u32x8::splat(pos.0);
                         let base_pos = base_pos_fp >> 24;
@@ -722,28 +731,28 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
                         }
                         I::wave_simd(cur_wave.try_into().unwrap_unchecked(), base_pos, sub_frac)
                     } else {
+                        // But this, does not get loop unroll and separate simd_path_rem != 0 path
+                        // Might be that this is more complex and involved than upper !DRUM code.
                         let lane: u32x8 = [0, 1, 2, 3, 4, 5, 6, 7].into();
                         let base_pos = u32x8::splat(pos.0) + lane * u32x8::splat(inc_i);
-                        let lane: f32x8 = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0].into();
-                        let sub_pos = lane.mul_add(f32x8::splat(inc_sub), f32x8::splat(pos_sub));
+                        // Using fixed point here as well is faster.
+                        // Though highest drum note at sample rate below
+                        // 2379Hz (76100 / Rate * 8 < 256) will produce incorrect result.
+                        let sub_pos = lane * u32x8::splat(inc_sub_24) + u32x8::splat(pos_sub);
+                        let sub_pos_i = sub_pos >> 24;
+                        let sub_pos_f: i32x8 =
+                            core::mem::transmute(sub_pos & u32x8::splat(I24MASK));
 
-                        let sub_pos_i: i32x8 = sub_pos.fast_trunc_int();
-                        let sub_pos_u: u32x8 = core::mem::transmute(sub_pos_i);
-                        // sub_pos.floor() seems to be slower here,
-                        // because floating point port is being overloaded?
-                        let sub_floor: f32x8 = sub_pos_i.round_float();
-
-                        let base_pos = base_pos + sub_pos_u;
-                        let sub_frac = sub_pos - sub_floor;
+                        let base_pos: u32x8 = base_pos + sub_pos_i;
+                        let sub_frac = sub_pos_f.round_float() / f32x8::splat(F24);
 
                         if i == simd_path_cnt - 1 && simd_path_rem != 0 {
-                            pos_sub = sub_frac.to_array()[simd_path_rem];
+                            pos_sub = sub_pos_f.to_array()[simd_path_rem] as u32;
                             pos = Wrapping(base_pos.to_array()[simd_path_rem]);
                         } else {
-                            pos_sub += inc_sub * 8.0;
-                            let sub_i = pos_sub.to_int_unchecked::<i32>();
-                            pos_sub -= sub_i as f32;
-                            pos += inc_i * 8 + sub_i as u32;
+                            pos_sub += inc_sub_24 * 8;
+                            pos += (pos_sub >> 24) + inc_i * 8;
+                            pos_sub &= I24MASK;
                         }
 
                         I::drum_simd(cur_wave, base_pos, sub_frac)
@@ -971,7 +980,7 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
                 n_events: if valid_wave { n_events } else { 0 }, // Must be 0 for invalid wave
                 phase_inc: 0.0,
                 phase_acc: 0,
-                phase_acc_sub: 0.0,
+                phase_acc_sub: Default::default(),
                 cur_pan: 0,
                 cur_vol: 0,
                 cur_len: 0,
@@ -1007,7 +1016,7 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
                 n_events: if valid_wave { n_events } else { 0 }, // Must be 0 for invalid wave
                 phase_inc: 0.0,
                 phase_acc: 0,
-                phase_acc_sub: 0.0,
+                phase_acc_sub: Default::default(),
                 cur_pan: 0,
                 cur_vol: 0,
                 cur_len: 0,
