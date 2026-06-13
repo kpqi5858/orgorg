@@ -281,19 +281,22 @@ mod _interp_impls {
 
     // Auto-vectorization friendly getter
     trait GatherUtils {
-        fn get_or_zero(&self, idx: u32) -> f32;
+        // Safety: Length is in [1, 500000]
+        unsafe fn get_or_zero(&self, idx: u32) -> f32;
+        // Safety: In bounds
         unsafe fn get_as_f32(&self, idx: u32) -> f32;
     }
 
     impl GatherUtils for [f32] {
         #[inline(always)]
-        fn get_or_zero(&self, idx: u32) -> f32 {
+        unsafe fn get_or_zero(&self, idx: u32) -> f32 {
             let len = self.len() as u32 - 1;
             let cond = 0_u32.wrapping_sub((idx <= len) as u32);
             let actual_idx = idx.min(len);
             // https://github.com/llvm/llvm-project/issues/163023
             // Missed optimization with `zext nneg` index then gather
             // This emits two vgatherqd instructions, not ideal single vgatherdd.
+            unsafe { core::hint::assert_unchecked(actual_idx < i32::MAX as u32) };
             let value = unsafe { *self.get_unchecked(actual_idx as usize) };
             f32::from_bits(value.to_bits() & cond)
         }
@@ -306,10 +309,11 @@ mod _interp_impls {
 
     impl GatherUtils for [i8] {
         #[inline(always)]
-        fn get_or_zero(&self, idx: u32) -> f32 {
+        unsafe fn get_or_zero(&self, idx: u32) -> f32 {
             let len = self.len() as u32 - 1;
             let cond = 0_u8.wrapping_sub((idx <= len) as u8);
             let actual_idx = idx.min(len);
+            unsafe { core::hint::assert_unchecked(actual_idx < i32::MAX as u32) };
             let value = unsafe { *self.get_unchecked(actual_idx as usize) };
             (value & cond as i8) as f32
         }
@@ -336,9 +340,11 @@ mod _interp_impls {
 
         #[inline(always)]
         unsafe fn drum(drum: &[OrgSmp], pos: u32, frac: f32) -> f32 {
-            let sample1 = drum.get_or_zero(pos);
-            let sample2 = drum.get_or_zero(pos.wrapping_add(1));
-            (sample2 - sample1).fma(frac, sample1)
+            unsafe {
+                let sample1 = drum.get_or_zero(pos);
+                let sample2 = drum.get_or_zero(pos.wrapping_add(1));
+                (sample2 - sample1).fma(frac, sample1)
+            }
         }
     }
 
@@ -350,8 +356,17 @@ mod _interp_impls {
 
         #[inline(always)]
         unsafe fn drum(drum: &[OrgSmp], pos: u32, _frac: f32) -> f32 {
-            drum.get_or_zero(pos)
+            unsafe { drum.get_or_zero(pos) }
         }
+    }
+
+    fn lagrange(s1: f32, s2: f32, s3: f32, s4: f32, frac: f32) -> f32 {
+        let c0 = s2;
+        let c1 = s4.fma(-1.0 / 6.0, s2.fma(-1.0 / 2.0, s1.fma(-1.0 / 3.0, s3)));
+        let c2 = (s1 + s3).fma(1.0 / 2.0, -s2);
+        let c3 = (s4 - s1).fma(1.0 / 6.0, (s2 - s3) * 1.0 / 2.0);
+
+        ((c3.fma(frac, c2)).fma(frac, c1)).fma(frac, c0)
     }
 
     impl OrgInterpolation for Lagrange {
@@ -372,12 +387,7 @@ mod _interp_impls {
                 let s3 = wave.get_as_f32(idx[2]);
                 let s4 = wave.get_as_f32(idx[3]);
 
-                let c0 = s2;
-                let c1 = s4.fma(-1.0 / 6.0, s2.fma(-1.0 / 2.0, s1.fma(-1.0 / 3.0, s3)));
-                let c2 = (s1 + s3).fma(1.0 / 2.0, -s2);
-                let c3 = (s4 - s1).fma(1.0 / 6.0, (s2 - s3) * 1.0 / 2.0);
-
-                ((c3.fma(frac, c2)).fma(frac, c1)).fma(frac, c0)
+                lagrange(s1, s2, s3, s4, frac)
             }
         }
 
@@ -390,17 +400,14 @@ mod _interp_impls {
                 pos.wrapping_add(1),
                 pos.wrapping_add(2),
             ];
-            let s1 = drum.get_or_zero(idx[0]);
-            let s2 = drum.get_or_zero(idx[1]);
-            let s3 = drum.get_or_zero(idx[2]);
-            let s4 = drum.get_or_zero(idx[3]);
+            unsafe {
+                let s1 = drum.get_or_zero(idx[0]);
+                let s2 = drum.get_or_zero(idx[1]);
+                let s3 = drum.get_or_zero(idx[2]);
+                let s4 = drum.get_or_zero(idx[3]);
 
-            let c0 = s2;
-            let c1 = s4.fma(-1.0 / 6.0, s2.fma(-1.0 / 2.0, s1.fma(-1.0 / 3.0, s3)));
-            let c2 = (s1 + s3).fma(1.0 / 2.0, -s2);
-            let c3 = (s4 - s1).fma(1.0 / 6.0, (s2 - s3) * 1.0 / 2.0);
-
-            ((c3.fma(frac, c2)).fma(frac, c1)).fma(frac, c0)
+                lagrange(s1, s2, s3, s4, frac)
+            }
         }
     }
 }
@@ -749,11 +756,11 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
         if song.len() < 114 {
             return None;
         }
-        // Safety: all following read is within index < 114
-        let song_reader = unsafe { UnsafeReader::new(song) };
         if !matches!(&song[0..6], b"Org-02" | b"Org-03") {
             return None;
         }
+        // Safety: all following read is within index < 114
+        let song_reader = unsafe { UnsafeReader::new(song) };
         let ms_per_beat = song_reader.read_u16(6);
         if ms_per_beat == 0 {
             return None;
@@ -793,7 +800,7 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
             let mut ret = Instrument {
                 tuning: song_reader.read_i16(offset),
                 pi,
-                n_events: if valid_wave { n_events } else { 0 }, // Must be 0 for invalid wave
+                n_events,
                 phase_inc: 0,
                 phase_acc: 0,
                 cur_pan: 0,
@@ -803,9 +810,14 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
                 loop_event: 0,
                 wave_idx: wave,
             };
-            ret.calculate_loop(loop_start, inst_data_ptr);
-            // Initial ticking for beat 0, since synth function will start ticking at beat 1
-            ret.tick(0, loop_start, rate, inst_data_ptr);
+            if valid_wave {
+                ret.calculate_loop(loop_start, inst_data_ptr);
+                // Initial ticking for beat 0, since synth function will start ticking at beat 1
+                ret.tick(0, loop_start, rate, inst_data_ptr);
+            } else {
+                ret.loop_event = u16::MAX;
+                ret.cur_event = u16::MAX;
+            }
             offset += 6;
             ins_data_offset += n_events as usize * 8;
             val.write(ret);
@@ -826,7 +838,7 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
             let mut ret = Instrument {
                 tuning: song_reader.read_i16(offset),
                 pi,
-                n_events: if valid_wave { n_events } else { 0 }, // Must be 0 for invalid wave
+                n_events,
                 phase_inc: 0,
                 phase_acc: 0,
                 cur_pan: 0,
@@ -836,9 +848,14 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
                 loop_event: 0,
                 wave_idx: wave,
             };
-            ret.calculate_loop(loop_start, inst_data_ptr);
-            // Initial ticking for beat 0, since synth function will start ticking at beat 1
-            ret.tick(0, loop_start, rate, inst_data_ptr);
+            if valid_wave {
+                ret.calculate_loop(loop_start, inst_data_ptr);
+                // Initial ticking for beat 0, since synth function will start ticking at beat 1
+                ret.tick(0, loop_start, rate, inst_data_ptr);
+            } else {
+                ret.loop_event = u16::MAX;
+                ret.cur_event = u16::MAX;
+            }
             offset += 6;
             ins_data_offset += n_events as usize * 8;
             val.write(ret);
