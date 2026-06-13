@@ -212,6 +212,9 @@ unsafe impl SoundbankProvider for Soundbank<'_> {
 ///
 /// Keep in mind that these functions are called at audio rate.
 /// You would like to put `#[inline]` and optimize them really well.
+///
+/// Implementer of `OrgInterpolation` must be ZST. Otherwise you will get compilation error.
+/// It is meant to be stateless.
 pub trait OrgInterpolation {
     /// How many samples prior to `pos` required by the interpolation.
     ///
@@ -1183,6 +1186,12 @@ impl OrgPlayBuilder<(), ()> {
 
 impl<I, A> OrgPlayBuilder<I, A> {
     pub fn with_interpolation<I2: OrgInterpolation>(self, _: I2) -> OrgPlayBuilder<I2, A> {
+        const {
+            assert!(
+                core::mem::size_of::<I2>() == 0,
+                "Implementer of OrgInterpolation must be ZST"
+            );
+        }
         OrgPlayBuilder(PhantomData, self.1, self.2)
     }
 
