@@ -21,7 +21,7 @@ fn main() {
     let mut orgplay = OrgPlayBuilder::new()
         .with_sample_rate(black_box(48000))
         .with_interpolation(Linear)
-        .with_asset_provider(ConstAsset)
+        .with_soundbank_provider(ConstAsset)
         .build(black_box(song))
         .unwrap();
     let mut cur = Instant::now();

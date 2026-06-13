@@ -82,7 +82,7 @@ fn criterion_benchmark(c: &mut Criterion) {
                 || {
                     (
                         OrgPlayBuilder::new()
-                            .with_asset_provider(ConstAsset)
+                            .with_soundbank_provider(ConstAsset)
                             .build(data)
                             .unwrap(),
                         vec![0.0_f32; 4096],

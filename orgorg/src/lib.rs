@@ -1185,7 +1185,6 @@ impl OrgPlayBuilder<(), ()> {
     ///
     /// Or, provide original Cave Story wavetable and drums by:
     /// - [`with_asset`](Self::with_asset)
-    /// - [`with_asset_provider`](Self::with_asset_provider).
     ///
     /// Otherwise it is compile error to call [`build`](Self::build).
     pub fn new() -> OrgPlayBuilder<crate::interp_impls::Linear, ()> {
@@ -1208,18 +1207,12 @@ impl<I, A> OrgPlayBuilder<I, A> {
 
     /// Will only properly play songs with original Cave Story drum sound effects.
     /// See [`CaveStoryAssetProvider`] for more information.
-    pub fn with_asset_provider<A2: CaveStoryAssetProvider>(self, a: A2) -> OrgPlayBuilder<I, A2> {
-        self.with_soundbank_provider(a)
-    }
-
-    /// Will only properly play songs with original Cave Story drum sound effects.
-    /// See [`CaveStoryAssetProvider`] for more information.
     pub fn with_asset<'a>(
         self,
         wavetable: &'a [u8; 25600],
         drum: &'a [u8; 40000],
     ) -> OrgPlayBuilder<I, AssetByRef<'a>> {
-        self.with_asset_provider(AssetByRef(wavetable, drum))
+        self.with_soundbank_provider(AssetByRef(wavetable, drum))
     }
 
     pub fn with_soundbank(self, a: Soundbank) -> OrgPlayBuilder<I, Soundbank> {

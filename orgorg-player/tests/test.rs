@@ -32,7 +32,7 @@ fn empty() {
     let mut player = OrgPlayBuilder::new()
         .with_sample_rate(1000)
         .with_interpolation(Linear)
-        .with_asset_provider(DummyProvider)
+        .with_soundbank_provider(DummyProvider)
         .build(song)
         .unwrap();
     let mut buf = vec![f32::NAN; 1024];
@@ -52,7 +52,7 @@ fn extreme_value() {
     let mut player = OrgPlayBuilder::new()
         .with_sample_rate(u32::MAX)
         .with_interpolation(NoInterp)
-        .with_asset_provider(DummyProvider)
+        .with_soundbank_provider(DummyProvider)
         .build(&song)
         .unwrap();
     let mut buf = vec![0.0; 4096];
@@ -63,7 +63,7 @@ fn extreme_value() {
     let mut player = OrgPlayBuilder::new()
         .with_sample_rate(1001)
         .with_interpolation(NoInterp)
-        .with_asset_provider(DummyProvider)
+        .with_soundbank_provider(DummyProvider)
         .build(&song)
         .unwrap();
     player.synth_stereo(&mut buf);
@@ -80,7 +80,7 @@ fn test1() {
     let mut player = OrgPlayBuilder::new()
         .with_sample_rate(sample_rate)
         .with_interpolation(Linear)
-        .with_asset_provider(DummyProvider)
+        .with_soundbank_provider(DummyProvider)
         .build(song)
         .unwrap();
     let mut buf_stereo = vec![0.0_f32; buf_len * 2];
@@ -90,7 +90,7 @@ fn test1() {
     let mut player = OrgPlayBuilder::new()
         .with_sample_rate(sample_rate)
         .with_interpolation(Linear)
-        .with_asset_provider(DummyProvider)
+        .with_soundbank_provider(DummyProvider)
         .build(song)
         .unwrap();
     let mut buf_mono = vec![0.0_f32; buf_len];
@@ -115,7 +115,7 @@ fn test1() {
         let mut player = OrgPlayBuilder::new()
             .with_sample_rate(sample_rate)
             .with_interpolation(Linear)
-            .with_asset_provider(DummyProvider)
+            .with_soundbank_provider(DummyProvider)
             .build(song)
             .unwrap();
         // Is output of synthesis output consistent with buffer size?
