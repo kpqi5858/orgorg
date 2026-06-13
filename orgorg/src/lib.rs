@@ -239,7 +239,7 @@ pub trait OrgInterpolation {
 
     /// Interpolate the `wave` from `(pos).(frac)`, in 8-lane.
     ///
-    /// `pos` should be wrapped by 256 (`& 0xff`) before indexing.
+    /// `pos` is guaranteed to be less than 256.
     #[cfg(feature = "simd")]
     fn wave_simd(wave: &[f32; 256], pos: wide::u32x8, frac: wide::f32x8) -> wide::f32x8;
 
@@ -325,7 +325,7 @@ mod _interp_impls {
     impl OrgInterpolation for Linear {
         #[inline(always)]
         fn wave_simd(wave: &[f32; 256], pos: u32x8, frac: f32x8) -> f32x8 {
-            let wave_data1 = retrieve_wave_data(wave, pos);
+            let wave_data1 = unsafe { gather(wave, pos) };
             let wave_data2 = retrieve_wave_data(wave, pos + u32x8::splat(1));
             // Linear Interpolation
             (wave_data2 - wave_data1).mul_add(frac, wave_data1)
@@ -345,7 +345,7 @@ mod _interp_impls {
     impl OrgInterpolation for NoInterp {
         #[inline(always)]
         fn wave_simd(wave: &[f32; 256], pos: u32x8, _frac: f32x8) -> f32x8 {
-            retrieve_wave_data(wave, pos)
+            unsafe { gather(wave, pos) }
         }
 
         #[inline(always)]
@@ -360,7 +360,7 @@ mod _interp_impls {
         #[inline(always)]
         fn wave_simd(wave: &[f32; 256], pos: u32x8, frac: f32x8) -> f32x8 {
             let s1 = retrieve_wave_data(wave, pos - u32x8::splat(1));
-            let s2 = retrieve_wave_data(wave, pos);
+            let s2 = unsafe { gather(wave, pos) };
             let s3 = retrieve_wave_data(wave, pos + u32x8::splat(1));
             let s4 = retrieve_wave_data(wave, pos + u32x8::splat(2));
 
@@ -514,6 +514,7 @@ struct Instrument<'a, I: OrgInterpolation, const DRUM: bool> {
     // TODO: Pre-calculate this value, not on the fly
     loop_event: Option<u16>,
     phase_inc: f32,
+    // In `simd` and non-DRUM, this is 8.24 phase accumulator. phase_acc_sub is not used.
     phase_acc: u32,
     phase_acc_sub: f32,
     cur_pan: u8,
@@ -698,26 +699,53 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
             let simd_path_cnt = n.div_ceil(8);
             let simd_path_rem = n % 8;
             unsafe {
+                // 8.24 fixed point arithmetic for wave channels
+                const I24: u32 = 0x1000000;
+                const I24MASK: u32 = I24 - 1;
+                const F24: f32 = I24 as f32;
+                let wave_inc = (inc_i << 24) | (inc_sub * F24).to_int_unchecked::<i32>() as u32;
+
                 for i in 0..simd_path_cnt {
-                    let lane: u32x8 = [0, 1, 2, 3, 4, 5, 6, 7].into();
-                    let base_pos = u32x8::splat(pos.0) + lane * u32x8::splat(inc_i);
-                    let lane: f32x8 = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0].into();
-                    let sub_pos = lane.mul_add(f32x8::splat(inc_sub), f32x8::splat(pos_sub));
+                    let result = if !DRUM {
+                        let lane: u32x8 = [0, 1, 2, 3, 4, 5, 6, 7].into();
+                        let base_pos_fp = lane * u32x8::splat(wave_inc) + u32x8::splat(pos.0);
+                        let base_pos = base_pos_fp >> 24;
+                        let sub_frac_i: i32x8 =
+                            core::mem::transmute(base_pos_fp & u32x8::splat(I24MASK));
+                        let sub_frac = sub_frac_i.round_float() / f32x8::splat(F24);
 
-                    let sub_pos_i: i32x8 = sub_pos.fast_trunc_int();
-                    let sub_pos_u: u32x8 = core::mem::transmute(sub_pos_i);
-                    // sub_pos.floor() seems to be slower here,
-                    // because floating point port is being overloaded?
-                    let sub_floor: f32x8 = sub_pos_i.round_float();
-
-                    let base_pos = base_pos + sub_pos_u;
-                    let sub_frac = sub_pos - sub_floor;
-
-                    let result = if DRUM {
-                        I::drum_simd(cur_wave, base_pos, sub_frac)
-                    } else {
-                        // Non-DRUM cur_wave is always 256-length.
+                        if i == simd_path_cnt - 1 && simd_path_rem != 0 {
+                            pos += wave_inc * simd_path_rem as u32;
+                        } else {
+                            pos += wave_inc * 8;
+                        }
                         I::wave_simd(cur_wave.try_into().unwrap_unchecked(), base_pos, sub_frac)
+                    } else {
+                        let lane: u32x8 = [0, 1, 2, 3, 4, 5, 6, 7].into();
+                        let base_pos = u32x8::splat(pos.0) + lane * u32x8::splat(inc_i);
+                        let lane: f32x8 = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0].into();
+                        let sub_pos = lane.mul_add(f32x8::splat(inc_sub), f32x8::splat(pos_sub));
+
+                        let sub_pos_i: i32x8 = sub_pos.fast_trunc_int();
+                        let sub_pos_u: u32x8 = core::mem::transmute(sub_pos_i);
+                        // sub_pos.floor() seems to be slower here,
+                        // because floating point port is being overloaded?
+                        let sub_floor: f32x8 = sub_pos_i.round_float();
+
+                        let base_pos = base_pos + sub_pos_u;
+                        let sub_frac = sub_pos - sub_floor;
+
+                        if i == simd_path_cnt - 1 && simd_path_rem != 0 {
+                            pos_sub = sub_frac.to_array()[simd_path_rem];
+                            pos = Wrapping(base_pos.to_array()[simd_path_rem]);
+                        } else {
+                            pos_sub += inc_sub * 8.0;
+                            let sub_i = pos_sub.to_int_unchecked::<i32>();
+                            pos_sub -= sub_i as f32;
+                            pos += inc_i * 8 + sub_i as u32;
+                        }
+
+                        I::drum_simd(cur_wave, base_pos, sub_frac)
                     };
 
                     if i == simd_path_cnt - 1 && simd_path_rem != 0 {
@@ -736,9 +764,6 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
                                 *buf.get_unchecked_mut(i * 16 + idx * 2 + 1) += sample * right;
                             }
                         }
-
-                        pos_sub = sub_frac.to_array()[simd_path_rem];
-                        pos = Wrapping(base_pos.to_array()[simd_path_rem]);
                     } else {
                         // Compiler is able to autovectorize below code nicely,
                         // but obviously does not emit fma.
@@ -778,11 +803,6 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
                             buf_1_ptr.cast::<f32x8>().write_unaligned(buf_1_res);
                             buf_2_ptr.cast::<f32x8>().write_unaligned(buf_2_res);
                         }
-
-                        pos_sub += inc_sub * 8.0;
-                        let sub_i = pos_sub.to_int_unchecked::<i32>();
-                        pos_sub -= sub_i as f32;
-                        pos += inc_i * 8 + sub_i as u32;
                     }
 
                     if DRUM && pos.0 >= cur_wave.len() as u32 + I::INTERP_REMNANT {
