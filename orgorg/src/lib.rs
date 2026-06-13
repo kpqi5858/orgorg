@@ -610,9 +610,17 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
             self.cur_vol = event.volume;
         }
         if event.panning != 255 {
-            let left = (12 - event.panning).min(6);
-            let right = event.panning.min(6);
-            self.cur_pan = (left << 4) | right;
+            const fn p(p: u8) -> u8 {
+                const fn min(a: u8, b: u8) -> u8 {
+                    if a > b { b } else { a }
+                }
+                let left = min(6, 12 - p);
+                let right = min(6, p);
+                (left << 4) | right
+            }
+            #[rustfmt::skip]
+            const LUT: [u8; 13] = [ p(0), p(1), p(2), p(3), p(4), p(5), p(6), p(7), p(8), p(9), p(10), p(11), p(12) ];
+            self.cur_pan = LUT[event.panning.min(12) as usize];
         }
         if event.note != 255 {
             self.phase_acc = 0;
