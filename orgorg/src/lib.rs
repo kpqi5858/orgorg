@@ -46,7 +46,7 @@
 //! Uses Fused Multiply Add where possible, which might improve performance if the platform supports it.
 //!
 //! - `fma` requires `std`.
-//! - `fma-nightly` does not require `std` but requires nightly compiler.
+//! - `fma-nightly` does not require `std` but requires nightly compiler, and it can be non-deterministic.
 //!
 //! # Cargo Features: `f32smp`
 //!
@@ -265,6 +265,7 @@ impl FmaUtils for f32 {
     fn fma(self, a: f32, b: f32) -> f32 {
         #[cfg(feature = "fma")]
         return self.mul_add(a, b);
+        // This is non-deterministic though. It's up to llvm.
         #[cfg(feature = "fma-nightly")]
         return self.algebraic_mul(a).algebraic_add(b);
         return (self * a) + b;
@@ -368,11 +369,11 @@ mod _interp_impls {
                 let s4 = wave.get_as_f32(idx[3]);
 
                 let c0 = s2;
-                let c1 = s3 - s1 * (1.0 / 3.0) - s2 * (1.0 / 2.0) - s4 * (1.0 / 6.0);
-                let c2 = (s1 + s3) * (1.0 / 2.0) - s2;
-                let c3 = (s4 - s1) * (1.0 / 6.0) + (s2 - s3) * (1.0 / 2.0);
+                let c1 = s4.fma(-1.0 / 6.0, s2.fma(-1.0 / 2.0, s1.fma(-1.0 / 3.0, s3)));
+                let c2 = (s1 + s3).fma(1.0 / 2.0, -s2);
+                let c3 = (s4 - s1).fma(1.0 / 6.0, (s2 - s3) * 1.0 / 2.0);
 
-                ((c3 * frac + c2) * frac + c1) * frac + c0
+                ((c3.fma(frac, c2)).fma(frac, c1)).fma(frac, c0)
             }
         }
 
@@ -391,11 +392,11 @@ mod _interp_impls {
             let s4 = drum.get_or_zero(idx[3]);
 
             let c0 = s2;
-            let c1 = s3 - s1 * (1.0 / 3.0) - s2 * (1.0 / 2.0) - s4 * (1.0 / 6.0);
-            let c2 = (s1 + s3) * (1.0 / 2.0) - s2;
-            let c3 = (s4 - s1) * (1.0 / 6.0) + (s2 - s3) * (1.0 / 2.0);
+            let c1 = s4.fma(-1.0 / 6.0, s2.fma(-1.0 / 2.0, s1.fma(-1.0 / 3.0, s3)));
+            let c2 = (s1 + s3).fma(1.0 / 2.0, -s2);
+            let c3 = (s4 - s1).fma(1.0 / 6.0, (s2 - s3) * 1.0 / 2.0);
 
-            ((c3 * frac + c2) * frac + c1) * frac + c0
+            ((c3.fma(frac, c2)).fma(frac, c1)).fma(frac, c0)
         }
     }
 }
