@@ -1,5 +1,5 @@
 #![cfg_attr(not(feature = "fma"), no_std)]
-#![cfg_attr(feature = "fma-nightly", feature(float_algebraic))]
+#![cfg_attr(feature = "fma-nightly", feature(core_float_math))]
 
 //! `no_std` compatible Cave Story Organya Music Player.
 //!
@@ -268,7 +268,7 @@ impl FmaUtils for f32 {
         return self.mul_add(a, b);
         // This is non-deterministic though. It's up to llvm.
         #[cfg(feature = "fma-nightly")]
-        return self.algebraic_mul(a).algebraic_add(b);
+        return core::f32::math::mul_add(self, a, b);
         return (self * a) + b;
     }
 }
@@ -360,6 +360,7 @@ mod _interp_impls {
         }
     }
 
+    #[inline(always)]
     fn lagrange(s1: f32, s2: f32, s3: f32, s4: f32, frac: f32) -> f32 {
         let c0 = s2;
         let c1 = s4.fma(-1.0 / 6.0, s2.fma(-1.0 / 2.0, s1.fma(-1.0 / 3.0, s3)));
