@@ -282,22 +282,10 @@ mod _interp_impls {
     #[inline(always)]
     unsafe fn gather(wave: &[f32], pos: u32x8) -> f32x8 {
         unsafe {
-            #[cfg(target_feature = "avx2")]
-            {
-                // It's slow, but slightly faster than scalar gather in my benchmark.
-                use core::arch::x86_64::_mm256_i32gather_ps;
-                core::mem::transmute(_mm256_i32gather_ps::<4>(
-                    wave.as_ptr(),
-                    core::mem::transmute(pos),
-                ))
-            }
-            #[cfg(not(target_feature = "avx2"))]
-            {
-                let pos = pos.to_array();
-                f32x8::from(core::array::from_fn(|i| {
-                    *wave.get_unchecked(pos[i] as usize)
-                }))
-            }
+            let pos = pos.to_array();
+            f32x8::from(core::array::from_fn(|i| {
+                *wave.get_unchecked(pos[i] as usize)
+            }))
         }
     }
 
@@ -319,7 +307,7 @@ mod _interp_impls {
             let base_pos = base_pos.min(cmp);
             // Masked gather exists in avx2, but it was slightly slower in my benchmark.
             let vals = gather(cur_wave, base_pos);
-            in_bounds.blend(vals, f32x8::splat(0.0))
+            in_bounds & vals
         }
     }
 
@@ -777,7 +765,6 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
                         let sub_frac = sub_pos_f.round_float() / f32x8::splat(F24);
 
                         if i == simd_path_cnt - 1 && simd_path_rem != 0 {
-                            // This *does* improves codegen.
                             cold_path();
                             pos_sub = sub_pos_f.to_array()[simd_path_rem] as u32;
                             pos = Wrapping(base_pos.to_array()[simd_path_rem]);
@@ -791,6 +778,7 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
                     };
 
                     if i == simd_path_cnt - 1 && simd_path_rem != 0 {
+                        cold_path();
                         // We calculated excess. Writing them all will cause oob write.
                         for (idx, sample) in result
                             .to_array()
@@ -848,7 +836,6 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
                     }
 
                     if DRUM && pos.0 >= cur_wave.len() as u32 + I::INTERP_REMNANT {
-                        // Not sure about this one.
                         cold_path();
                         self.cur_len = 0;
                         self.phase_inc = 0;
