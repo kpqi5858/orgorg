@@ -1,4 +1,5 @@
-#![cfg_attr(not(feature = "std"), no_std)]
+#![cfg_attr(not(feature = "fma"), no_std)]
+#![cfg_attr(feature = "fma-nightly", feature(float_algebraic))]
 
 //! `no_std` compatible Cave Story Organya Music Player.
 //!
@@ -40,40 +41,47 @@
 //! And see [`wdb`](https://github.com/kpqi5858/orgorg/blob/main/orgorg-player/src/wdb.rs)
 //! module in orgorg-player for loading `soundbank.wdb`.
 //!
-//! # Cargo Features: `simd`
+//! # Cargo Features: `fma` and `fma-nightly`
 //!
-//! Uses [`wide`](https://crates.io/crates/wide) crate for synthesis with 8-lane SIMD,
-//! which may gain performance where the platform can benefit from it.
+//! Uses Fused Multiply Add where possible, which might improve performance if the platform supports it.
 //!
-//! On my x86 PC with AVX2 and Raspberry Pi 5, it yields up to ~2x speedup.
+//! - `fma` requires `std`.
+//! - `fma-nightly` does not require `std` but requires nightly compiler.
 //!
-//! Keep in mind that:
-//! - There is no built-in multiversioning.
-//! - If the platform or build configuration does not support SIMD well,
-//!   it can result in worse performance due to scalar emulation of SIMD instructions.
-//! - The output may differ slightly between `simd` and non-`simd`.
-//! - API is incompatible between `simd` and non-`simd`.
-//!   - Type of drums and wavetable becomes f32 instead of i8, for performance reasons.
-//!   - [`OrgInterpolation`] functions are mutually exclusive.
+//! # Cargo Features: `f32smp`
+//!
+//! Uses `f32` instead of `i8` for the type of drums and wavetable sample ([`OrgSmp`]),
+//! which will improve performance on modern platforms at the cost of more memory usage for sample data.
 //!
 //! # Performance
-//! It is fast and does not allocate memory at all. But with following caveats.
+//! It is programmed to take maximum advantage of LLVM's auto-vectorization thus
+//! extremely fast on modern platforms. Plus it is optimized for embedded usage:
 //!
-//! - FPU should be present for maximum performance,
-//!   since there are lots of single-precision(f32) floating point arithmetic.
+//! - Does not perform any dynamic memory allocation at all.
+//! - No integer division.
+//! - No `f64` arithmetic.
+//! - No 64-bit arithmetic on 32-bit platform.
+//!
+//! But with following caveats.
+//!
+//! - FPU should be present for maximum performance, since there are lots of `f32` arithmetic.
 //! - This crate uses some unsafe to boost the performance.
 //!   The author tried to ensure safety but, who knows. Feel free to audit the code.
 //! - As you might guessed from generic [`OrgPlay`] type,
 //!   constructing many variants of `OrgPlay` may lead to size bloat.
+//!
+//! If you want numbers, my x86 PC can synthesize Cave Story Main Theme at 7700x speed.
+//! (Linear Interpolation, 48000 Hz Stereo, `fma` & `f32smp`).
 
 use core::{cmp, marker::PhantomData, mem::MaybeUninit, num::Wrapping, ptr::NonNull};
 
 const MASTER_VOLUME: f32 = 1.0 / (1 << 19) as f32;
 
 /// Type of drums and wavetable data.
-///
-/// [`f32`] if `simd`, [`i8`] if not `simd`.
+#[cfg(feature = "f32smp")]
 pub type OrgSmp = f32;
+#[cfg(not(feature = "f32smp"))]
+pub type OrgSmp = i8;
 
 /// Provides original Cave Story wavetable and drum samples to [`OrgPlay`].
 ///
@@ -207,6 +215,7 @@ unsafe impl SoundbankProvider for Soundbank<'_> {
 ///
 /// Keep in mind that these functions are called at audio rate.
 /// You would like to put `#[inline]` and optimize them really well.
+/// It should be auto-vectorization friendly.
 ///
 /// Implementer of `OrgInterpolation` must be ZST. Otherwise you will get compilation error.
 /// It is meant to be stateless.
@@ -222,7 +231,7 @@ pub trait OrgInterpolation {
     /// Interpolate the `wave` from `(pos).(frac)`.
     ///
     /// `pos` should be wrapped by 256 (`& 0xff`) before indexing.
-    fn wave(wave: &[f32; 256], pos: u32, frac: f32) -> f32;
+    fn wave(wave: &[OrgSmp; 256], pos: u32, frac: f32) -> f32;
 
     /// Interpolate the `drum` from `(pos).(frac)`.
     ///
@@ -230,7 +239,7 @@ pub trait OrgInterpolation {
     ///
     /// If `drum.len()` is too big (Exact value is not specified, but not greater than
     /// [`SoundbankProvider::get_drum`] requirement), it can produce incorrect result.
-    fn drum(drum: &[f32], pos: u32, frac: f32) -> f32;
+    fn drum(drum: &[OrgSmp], pos: u32, frac: f32) -> f32;
 }
 
 /// Builtin [`OrgInterpolation`] implementations.
@@ -245,15 +254,37 @@ pub mod interp_impls {
     pub struct Lagrange;
 }
 
+trait FmaUtils {
+    fn fma(self, a: f32, b: f32) -> f32;
+}
+
+impl FmaUtils for f32 {
+    #[allow(unreachable_code)]
+    #[allow(clippy::needless_return)]
+    #[inline(always)]
+    fn fma(self, a: f32, b: f32) -> f32 {
+        #[cfg(feature = "fma")]
+        return self.mul_add(a, b);
+        #[cfg(feature = "fma-nightly")]
+        return self.algebraic_mul(a).algebraic_add(b);
+        return (self * a) + b;
+    }
+}
+
 mod _interp_impls {
+    use super::FmaUtils;
     use super::OrgInterpolation;
+    use super::OrgSmp;
     use super::interp_impls::*;
 
-    trait BranchlessGather {
+    // Auto-vectorization friendly getter
+    trait GatherUtils {
         fn get_or_zero(&self, idx: u32) -> f32;
+        unsafe fn get_as_f32(&self, idx: u32) -> f32;
     }
 
-    impl BranchlessGather for [f32] {
+    impl GatherUtils for [f32] {
+        #[inline(always)]
         fn get_or_zero(&self, idx: u32) -> f32 {
             let len = self.len() as u32 - 1;
             let cond = 0_u32.wrapping_sub((idx <= len) as u32);
@@ -261,36 +292,59 @@ mod _interp_impls {
             let value = unsafe { *self.get_unchecked(actual_idx as usize) };
             f32::from_bits(value.to_bits() & cond)
         }
+
+        #[inline(always)]
+        unsafe fn get_as_f32(&self, idx: u32) -> f32 {
+            unsafe { *self.get_unchecked(idx as usize) }
+        }
+    }
+
+    impl GatherUtils for [i8] {
+        #[inline(always)]
+        fn get_or_zero(&self, idx: u32) -> f32 {
+            let len = self.len() as u32 - 1;
+            let cond = 0_u8.wrapping_sub((idx <= len) as u8);
+            let actual_idx = idx.min(len);
+            let value = unsafe { *self.get_unchecked(actual_idx as usize) };
+            (value & cond as i8) as f32
+        }
+
+        #[inline(always)]
+        unsafe fn get_as_f32(&self, idx: u32) -> f32 {
+            unsafe { *self.get_unchecked(idx as usize) as f32 }
+        }
     }
 
     impl OrgInterpolation for Linear {
         #[inline(always)]
-        fn wave(wave: &[f32; 256], pos: u32, frac: f32) -> f32 {
-            let idx1 = pos & 0xff;
-            let sample1 = wave[idx1 as usize];
-            let idx2 = pos.wrapping_add(1) & 0xff;
-            let sample2 = wave[idx2 as usize];
-            // The "imprecise" lerp (see Wikipedia Linear Interpolation).
-            // Monotonic, and slightly fast over "precise" one.
-            (sample2 - sample1).mul_add(frac, sample1)
+        fn wave(wave: &[OrgSmp; 256], pos: u32, frac: f32) -> f32 {
+            unsafe {
+                let idx1 = pos & 0xff;
+                let sample1 = wave.get_as_f32(idx1);
+                let idx2 = pos.wrapping_add(1) & 0xff;
+                let sample2 = wave.get_as_f32(idx2);
+                // The "imprecise" lerp (see Wikipedia Linear Interpolation).
+                // Monotonic, and slightly fast over "precise" one.
+                (sample2 - sample1).fma(frac, sample1)
+            }
         }
 
         #[inline(always)]
-        fn drum(drum: &[f32], pos: u32, frac: f32) -> f32 {
+        fn drum(drum: &[OrgSmp], pos: u32, frac: f32) -> f32 {
             let sample1 = drum.get_or_zero(pos);
             let sample2 = drum.get_or_zero(pos.wrapping_add(1));
-            (sample2 - sample1).mul_add(frac, sample1)
+            (sample2 - sample1).fma(frac, sample1)
         }
     }
 
     impl OrgInterpolation for NoInterp {
         #[inline(always)]
-        fn wave(wave: &[f32; 256], pos: u32, _frac: f32) -> f32 {
-            wave[(pos & 0xff) as usize]
+        fn wave(wave: &[OrgSmp; 256], pos: u32, _frac: f32) -> f32 {
+            unsafe { wave.get_as_f32(pos & 0xff) }
         }
 
         #[inline(always)]
-        fn drum(drum: &[f32], pos: u32, _frac: f32) -> f32 {
+        fn drum(drum: &[OrgSmp], pos: u32, _frac: f32) -> f32 {
             drum.get_or_zero(pos)
         }
     }
@@ -299,29 +353,31 @@ mod _interp_impls {
         const INTERP_REMNANT: u32 = 1;
 
         #[inline(always)]
-        fn wave(wave: &[f32; 256], pos: u32, frac: f32) -> f32 {
+        fn wave(wave: &[OrgSmp; 256], pos: u32, frac: f32) -> f32 {
             #[rustfmt::skip]
             let idx = [
-                pos.wrapping_sub(1) as usize & 0xff,
-                pos                 as usize & 0xff,
-                pos.wrapping_add(1) as usize & 0xff,
-                pos.wrapping_add(2) as usize & 0xff,
+                pos.wrapping_sub(1) & 0xff,
+                pos                 & 0xff,
+                pos.wrapping_add(1) & 0xff,
+                pos.wrapping_add(2) & 0xff,
             ];
-            let s1 = wave[idx[0]];
-            let s2 = wave[idx[1]];
-            let s3 = wave[idx[2]];
-            let s4 = wave[idx[3]];
+            unsafe {
+                let s1 = wave.get_as_f32(idx[0]);
+                let s2 = wave.get_as_f32(idx[1]);
+                let s3 = wave.get_as_f32(idx[2]);
+                let s4 = wave.get_as_f32(idx[3]);
 
-            let c0 = s2;
-            let c1 = s3 - s1 * (1.0 / 3.0) - s2 * (1.0 / 2.0) - s4 * (1.0 / 6.0);
-            let c2 = (s1 + s3) * (1.0 / 2.0) - s2;
-            let c3 = (s4 - s1) * (1.0 / 6.0) + (s2 - s3) * (1.0 / 2.0);
+                let c0 = s2;
+                let c1 = s3 - s1 * (1.0 / 3.0) - s2 * (1.0 / 2.0) - s4 * (1.0 / 6.0);
+                let c2 = (s1 + s3) * (1.0 / 2.0) - s2;
+                let c3 = (s4 - s1) * (1.0 / 6.0) + (s2 - s3) * (1.0 / 2.0);
 
-            ((c3 * frac + c2) * frac + c1) * frac + c0
+                ((c3 * frac + c2) * frac + c1) * frac + c0
+            }
         }
 
         #[inline(always)]
-        fn drum(drum: &[f32], pos: u32, frac: f32) -> f32 {
+        fn drum(drum: &[OrgSmp], pos: u32, frac: f32) -> f32 {
             #[rustfmt::skip]
             let idx = [
                 pos.wrapping_sub(1),
@@ -368,6 +424,8 @@ struct Instrument<const DRUM: bool> {
     // Invariants:
     // - If n_events != 0, must point to valid wave
     wave_idx: u8,
+    // For DRUM, this is fractional part of phase accumulator
+    // For !DRUM, this is length
     cur_len_or_phase_acc: u32,
 }
 
@@ -565,12 +623,12 @@ impl<const DRUM: bool> Instrument<DRUM> {
                 };
                 if MONO {
                     let v = &mut chunk[0];
-                    *v = sample.mul_add(mono, *v);
+                    *v = sample.fma(mono, *v);
                 } else {
                     let v = &mut chunk[0];
-                    *v = sample.mul_add(left, *v);
+                    *v = sample.fma(left, *v);
                     let v = &mut chunk[1];
-                    *v = sample.mul_add(right, *v);
+                    *v = sample.fma(right, *v);
                 }
             }
             if DRUM {

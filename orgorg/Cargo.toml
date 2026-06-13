@@ -9,7 +9,9 @@ keywords = ["no_std", "audio", "music"]
 repository = "https://github.com/kpqi5858/orgorg"
 
 [features]
-std = []
+fma = []
+fma-nightly = []
+f32smp = []
 
 [dependencies]
 wide = { version = "1.1.1", optional = true }
