@@ -1,11 +1,11 @@
-use orgorg::Soundbank;
+use orgorg::{Soundbank, wt};
 use self_cell::self_cell;
 
-type OwnedSoundbankRef<'a> = (&'a [u8; 25600], Box<[&'a [i8]]>);
+type OwnedSoundbankRef<'a> = (&'a [wt; 25600], Box<[&'a [wt]]>);
 
 self_cell!(
     pub struct OwnedSoundbank {
-        owner: Box<[u8]>,
+        owner: Box<[wt]>,
         #[covariant]
         dependent: OwnedSoundbankRef,
     }
@@ -24,36 +24,33 @@ impl OwnedSoundbank {
 /// - Until end of the file:
 ///   - Wave length N in u32 little-endian.
 ///   - Followed by N length i8 wave data. Need to subtract 0x80 for each sample.
-pub fn from_soundbank_wdb(mut wdb: Vec<u8>) -> Option<OwnedSoundbank> {
-    fn fix_samples(wdb: &mut [u8]) -> Option<usize> {
-        if wdb.len() < 25600 {
-            return None;
-        }
-        let mut cnt = 0;
-        let mut offset = 25600;
-        while offset < wdb.len() {
-            let len = u32::from_le_bytes(wdb.get(offset..offset + 4)?.try_into().unwrap()) as usize;
-            let slice: &mut [i8] =
-                zerocopy::transmute_mut!(wdb.get_mut(offset + 4..offset + 4 + len)?);
-            slice
-                .iter_mut()
-                .for_each(|v| *v = v.wrapping_sub_unsigned(0x80));
-            offset += 4 + len;
-            cnt += 1;
-        }
-        if offset == wdb.len() { Some(cnt) } else { None }
+pub fn from_soundbank_wdb(wdb: Vec<u8>) -> Option<OwnedSoundbank> {
+    if wdb.len() < 25600 {
+        return None;
     }
-    let cnt = fix_samples(&mut wdb)?;
-    Some(OwnedSoundbank::new(wdb.into_boxed_slice(), |v| {
-        let wavetable = v[0..25600].try_into().unwrap();
-        let mut drums = Vec::with_capacity(cnt);
-        let mut offset = 25600;
-        while offset < v.len() {
-            let len = u32::from_le_bytes(v[offset..offset + 4].try_into().unwrap()) as usize;
-            let slice = &v[offset + 4..offset + 4 + len];
-            drums.push(zerocopy::transmute_ref!(slice));
-            offset += len + 4;
-        }
-        (wavetable, drums.into_boxed_slice())
+    let mut data = vec![];
+    data.extend(wdb[0..25600].iter().map(|v| *v as i8 as wt));
+    let mut len = vec![];
+    let mut offset = 25600;
+    while offset < wdb.len() {
+        let cur_len = u32::from_le_bytes(wdb.get(offset..offset + 4)?.try_into().unwrap()) as usize;
+        let slice = wdb.get(offset + 4..offset + 4 + cur_len)?;
+        data.extend(slice.iter().map(|v| v.wrapping_sub(0x80) as i8 as wt));
+        offset += 4 + cur_len;
+        len.push(cur_len);
+    }
+    if offset != wdb.len() {
+        return None;
+    }
+
+    Some(OwnedSoundbank::new(data.into_boxed_slice(), |data| {
+        let (wavetable, mut drums) = data.split_at(25600);
+        let wavetable = wavetable.try_into().unwrap();
+        let drums_arr = len.iter().map(|v| {
+            let (a, b) = drums.split_at(*v);
+            drums = b;
+            a
+        });
+        (wavetable, drums_arr.collect())
     }))
 }

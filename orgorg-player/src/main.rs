@@ -20,7 +20,7 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
 use is_terminal::IsTerminal;
-use orgorg::{CaveStoryAssetProvider, OrgPlay, OrgPlayBuilder, PlayResult, PlayTill, Soundbank};
+use orgorg::{OrgPlay, OrgPlayBuilder, PlayResult, PlayTill, Soundbank, wt};
 use self_cell::self_cell;
 
 use crate::{
@@ -91,17 +91,7 @@ struct PlayerControl {
     played_samples: AtomicU64,
 }
 
-struct AssetByDump([u8; 25600], [u8; 40000]);
-
-impl CaveStoryAssetProvider for &AssetByDump {
-    fn wavetable(&self) -> &[u8; 25600] {
-        &self.0
-    }
-
-    fn drum(&self) -> &[u8; 40000] {
-        &self.1
-    }
-}
+struct AssetByDump([i8; 25600], [i8; 40000]);
 
 trait DynOrgPlay: Send {
     fn synth_mono_till(&mut self, buf: &mut [f32], till: PlayTill) -> PlayResult;
@@ -311,18 +301,16 @@ fn dump_and_synth(file: &Path) -> Result<AssetByDump> {
         drums.append(&mut synth_pxt(pxt));
     }
     let drums: [i8; 40000] = drums.try_into().ok().context("Invalid drums length")?;
-    let drums: [u8; 40000] = zerocopy::transmute!(drums);
 
-    Ok(AssetByDump(wavetable, drums))
+    Ok(AssetByDump(zerocopy::transmute!(wavetable), drums))
 }
 
 fn to_soundbank(asset: AssetByDump) -> OwnedSoundbank {
     let mut data = Vec::with_capacity(25600 + 40000);
-    data.extend(asset.0);
-    data.extend(asset.1);
+    data.extend(asset.0.into_iter().map(|v| v as wt));
+    data.extend(asset.1.into_iter().map(|v| v as wt));
     OwnedSoundbank::new(data.into_boxed_slice(), |d| {
         let (wavetable, drums) = d.split_at(25600);
-        let drums: &[i8] = zerocopy::transmute_ref!(drums);
         let drums = Box::new([
             &drums[0..5000],
             &[],
@@ -387,9 +375,11 @@ fn main() -> Result<()> {
             let exe = args.sound.unwrap_or(PathBuf::from("./Doukutsu.exe"));
             let asset_by_dump =
                 dump_and_synth(&exe).context("Cannot extract sound from Doukutsu.exe")?;
-            std::fs::write("./wavetable.dat", asset_by_dump.0.as_slice())?;
+            let data: &[u8] = zerocopy::transmute_ref!(asset_by_dump.0.as_slice());
+            std::fs::write("./wavetable.dat", data)?;
             println!("Wrote wavetables to ./wavetable.dat");
-            std::fs::write("./drums.dat", asset_by_dump.1.as_slice())?;
+            let data: &[u8] = zerocopy::transmute_ref!(asset_by_dump.1.as_slice());
+            std::fs::write("./drums.dat", data)?;
             println!("Wrote drums to ./drums.dat");
             Ok(())
         }

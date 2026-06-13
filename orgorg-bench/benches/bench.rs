@@ -1,18 +1,28 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use orgorg::{CaveStoryAssetProvider, OrgPlayBuilder};
+use orgorg::{CaveStoryAssetProvider, OrgPlayBuilder, wt};
 use std::hint::black_box;
+
+const fn to_wt_array<const N: usize>(arr: [u8; N]) -> [wt; N] {
+    let mut a = [unsafe { core::mem::zeroed() }; N];
+    let mut i = 0;
+    while i < N {
+        a[i] = arr[i] as wt;
+        i += 1;
+    }
+    a
+}
 
 struct ConstAsset;
 
 impl CaveStoryAssetProvider for ConstAsset {
     #[inline(always)]
-    fn wavetable(&self) -> &[u8; 25600] {
-        include_bytes!("../wavetable.dat")
+    fn wavetable(&self) -> &[wt; 25600] {
+        &const { to_wt_array(*include_bytes!("../wavetable.dat")) }
     }
 
     #[inline(always)]
-    fn drum(&self) -> &[u8; 40000] {
-        include_bytes!("../drums.dat")
+    fn drum(&self) -> &[wt; 40000] {
+        &const { to_wt_array(*include_bytes!("../drums.dat")) }
     }
 }
 

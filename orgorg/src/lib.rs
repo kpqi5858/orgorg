@@ -9,8 +9,8 @@
 //! // Basic example for playing Org-02 music with original Cave Story drum sound effects.
 //! use orgorg::{OrgPlay, OrgPlayBuilder, AssetByRef, interp_impls::Linear};
 //!
-//! let wavetable: &[u8; 25600] = todo!();
-//! let drum: &[u8; 40000] = todo!();
+//! let wavetable: &[i8; 25600] = todo!();
+//! let drum: &[i8; 40000] = todo!();
 //! let org: &[u8] = todo!();
 //!
 //! let mut player: OrgPlay<'_, Linear, AssetByRef<'_>> = OrgPlayBuilder::new()
@@ -43,13 +43,16 @@
 //! Uses [`wide`](https://crates.io/crates/wide) crate for synthesis with 8-lane SIMD,
 //! which may gain performance where the platform can benefit from it.
 //!
-//! On my x86 PC with AVX2 and Raspberry Pi 5, it yields ~1.8x speedup.
+//! On my x86 PC with AVX2 and Raspberry Pi 5, it yields up to ~2x speedup.
 //!
 //! Keep in mind that:
 //! - There is no built-in multiversioning.
 //! - If the platform or build configuration does not support SIMD well,
 //!   it can result in worse performance due to scalar emulation of SIMD instructions.
 //! - The output may differ slightly between `simd` and non-`simd`.
+//! - API is incompatible between `simd` and non-`simd`.
+//!   - Type of drums and wavetable becomes f32 instead of i8, for performance reasons.
+//!   - [`OrgInterpolation`] functions are mutually exclusive.
 //!
 //! # Performance
 //! It is fast and does not allocate memory at all. But with following caveats.
@@ -65,6 +68,16 @@ use core::{cmp, marker::PhantomData, mem::MaybeUninit, num::Wrapping, ptr::NonNu
 
 const MASTER_VOLUME: f32 = 1.0 / (1 << 19) as f32;
 
+/// Type of drums and wavetable data.
+///
+/// [`f32`] if `simd`, [`i8`] if not `simd`.
+#[cfg(feature = "simd")]
+#[allow(non_camel_case_types)]
+pub type wt = f32;
+#[cfg(not(feature = "simd"))]
+#[allow(non_camel_case_types)]
+pub type wt = i8;
+
 /// Provides original Cave Story wavetable and drum samples to [`OrgPlay`].
 ///
 /// With this trait, it can play Org-02 musics that uses original Cave Story drum sound effects.
@@ -73,28 +86,13 @@ const MASTER_VOLUME: f32 = 1.0 / (1 << 19) as f32;
 /// You don't need to implement this trait to use [`OrgPlay`],
 /// as [`OrgPlayBuilder::with_asset`] will use default implementation
 /// that holds references to the data.
-///
-/// But if you want zero-sized provider, use this snippet in your code.
-/// ```ignore
-/// struct ConstAsset;
-///
-/// impl CaveStoryAssetProvider for ConstAsset {
-///     fn wavetable(&self) -> &[u8; 25600] {
-///         include_bytes!("./wavetable.dat")
-///     }
-///
-///     fn drum(&self) -> &[u8; 40000] {
-///         include_bytes!("./drums.dat")
-///     }
-/// }
-/// ```
 pub trait CaveStoryAssetProvider {
     /// The original `wavetable.dat` file.
-    fn wavetable(&self) -> &[u8; 25600];
+    fn wavetable(&self) -> &[wt; 25600];
     /// 6 pxt samples concatenated.
     ///
     /// Order is: fx96, fx97, fx9a, fx98, fx99, fx9b
-    fn drum(&self) -> &[u8; 40000];
+    fn drum(&self) -> &[wt; 40000];
 }
 
 /// Provides wavetable and drum samples to [`OrgPlay`].
@@ -112,7 +110,7 @@ pub trait CaveStoryAssetProvider {
 /// In other words, don't tamper with outputs using interior mutability or external source.
 pub unsafe trait SoundbankProvider {
     /// The original `wavetable.dat` file, or 100 concatenated 256-length waves.
-    fn wavetable(&self) -> &[u8; 25600];
+    fn wavetable(&self) -> &[wt; 25600];
 
     /// The drum channel with `idx` wave will be silenced if this returns `false`.
     fn is_drum_valid(&self, idx: u8) -> bool;
@@ -121,13 +119,13 @@ pub unsafe trait SoundbankProvider {
     /// # Safety
     /// Caller must not call this function
     /// if [`SoundbankProvider::is_drum_valid`] with given `idx` would return `false`.
-    unsafe fn get_drum(&self, idx: u8) -> &[i8];
+    unsafe fn get_drum(&self, idx: u8) -> &[wt];
 }
 
 // Safety: All function is consistent.
 unsafe impl<T: CaveStoryAssetProvider> SoundbankProvider for T {
     #[inline(always)]
-    fn wavetable(&self) -> &[u8; 25600] {
+    fn wavetable(&self) -> &[wt; 25600] {
         CaveStoryAssetProvider::wavetable(self)
     }
 
@@ -137,7 +135,7 @@ unsafe impl<T: CaveStoryAssetProvider> SoundbankProvider for T {
     }
 
     #[inline(always)]
-    unsafe fn get_drum(&self, idx: u8) -> &[i8] {
+    unsafe fn get_drum(&self, idx: u8) -> &[wt] {
         let drums = CaveStoryAssetProvider::drum(self).as_ptr();
         unsafe {
             let range = match idx {
@@ -149,22 +147,22 @@ unsafe impl<T: CaveStoryAssetProvider> SoundbankProvider for T {
                 8 => (36000, 4000),
                 _ => core::hint::unreachable_unchecked(),
             };
-            core::slice::from_raw_parts(drums.add(range.0).cast(), range.1)
+            core::slice::from_raw_parts(drums.add(range.0), range.1)
         }
     }
 }
 
 /// Default provider used in [`OrgPlayBuilder::with_asset`]
-pub struct AssetByRef<'a>(&'a [u8; 25600], &'a [u8; 40000]);
+pub struct AssetByRef<'a>(&'a [wt; 25600], &'a [wt; 40000]);
 
 impl CaveStoryAssetProvider for AssetByRef<'_> {
     #[inline(always)]
-    fn wavetable(&self) -> &[u8; 25600] {
+    fn wavetable(&self) -> &[wt; 25600] {
         self.0
     }
 
     #[inline(always)]
-    fn drum(&self) -> &[u8; 40000] {
+    fn drum(&self) -> &[wt; 40000] {
         self.1
     }
 }
@@ -174,8 +172,8 @@ impl CaveStoryAssetProvider for AssetByRef<'_> {
 /// 43 drums will play Org-03 songs properly.
 #[derive(Clone)]
 pub struct Soundbank<'a> {
-    wavetable: &'a [u8; 25600],
-    drums: &'a [&'a [i8]],
+    wavetable: &'a [wt; 25600],
+    drums: &'a [&'a [wt]],
 }
 
 impl<'a> Soundbank<'a> {
@@ -184,7 +182,7 @@ impl<'a> Soundbank<'a> {
     /// - More than 255 `drums` is effectively ignored.
     /// - If length of a drum is not in `[1, 500000]`,
     ///   that particular drum is considered invalid and won't play a sound.
-    pub fn new(wavetable: &'a [u8; 25600], drums: &'a [&'a [i8]]) -> Self {
+    pub fn new(wavetable: &'a [wt; 25600], drums: &'a [&'a [wt]]) -> Self {
         Self { wavetable, drums }
     }
 }
@@ -192,7 +190,7 @@ impl<'a> Soundbank<'a> {
 // Safety: All function is consistent.
 unsafe impl SoundbankProvider for Soundbank<'_> {
     #[inline(always)]
-    fn wavetable(&self) -> &[u8; 25600] {
+    fn wavetable(&self) -> &[wt; 25600] {
         self.wavetable
     }
 
@@ -203,7 +201,7 @@ unsafe impl SoundbankProvider for Soundbank<'_> {
     }
 
     #[inline(always)]
-    unsafe fn get_drum(&self, idx: u8) -> &[i8] {
+    unsafe fn get_drum(&self, idx: u8) -> &[wt] {
         unsafe { self.drums.get_unchecked(idx as usize) }
     }
 }
@@ -243,7 +241,7 @@ pub trait OrgInterpolation {
     ///
     /// `pos` should be wrapped by 256 (`& 0xff`) before indexing.
     #[cfg(feature = "simd")]
-    fn wave_simd(wave: &[i8; 256], pos: wide::u32x8, frac: wide::f32x8) -> wide::f32x8;
+    fn wave_simd(wave: &[f32; 256], pos: wide::u32x8, frac: wide::f32x8) -> wide::f32x8;
 
     /// Interpolate the `drum` from `(pos).(frac)`, in 8-lane.
     ///
@@ -255,7 +253,7 @@ pub trait OrgInterpolation {
     /// # Safety
     /// `drum` must not be empty slice.
     #[cfg(feature = "simd")]
-    unsafe fn drum_simd(drum: &[i8], pos: wide::u32x8, frac: wide::f32x8) -> wide::f32x8;
+    unsafe fn drum_simd(drum: &[f32], pos: wide::u32x8, frac: wide::f32x8) -> wide::f32x8;
 }
 
 /// Builtin [`OrgInterpolation`] implementations.
@@ -279,38 +277,54 @@ mod _interp_impls {
 
     // Helper functions
 
+    /// Safety: each pos must be in bounds
     #[inline(always)]
-    fn retrieve_wave_data(cur_wave: &[i8; 256], base_pos: u32x8) -> f32x8 {
+    unsafe fn gather(wave: &[f32], pos: u32x8) -> f32x8 {
         unsafe {
-            let base_pos = (base_pos & u32x8::splat(0xff)).to_array();
-            // If cur_wave were f32 slice, _mm256_i32gather_ps can be used here.
-            // This generates 8 read instructions, compared to single VGATHERDPS.
-            // But i8 array is friendlier to cpu caches, so I guess cancels out.
-            // Also compiler is smart enough to vectorize i8 to f32 cast here.
-            f32x8::from(core::array::from_fn(|i| {
-                *cur_wave.get_unchecked(base_pos[i] as usize) as f32
-            }))
+            #[cfg(target_feature = "avx2")]
+            {
+                // It's slow, but slightly faster than scalar gather in my benchmark.
+                use core::arch::x86_64::_mm256_i32gather_ps;
+                core::mem::transmute(_mm256_i32gather_ps::<4>(
+                    wave.as_ptr(),
+                    core::mem::transmute(pos),
+                ))
+            }
+            #[cfg(not(target_feature = "avx2"))]
+            {
+                let pos = pos.to_array();
+                f32x8::from(core::array::from_fn(|i| {
+                    *wave.get_unchecked(pos[i] as usize)
+                }))
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn retrieve_wave_data(cur_wave: &[f32; 256], base_pos: u32x8) -> f32x8 {
+        unsafe {
+            let base_pos = base_pos & u32x8::splat(0xff);
+            gather(cur_wave, base_pos)
         }
     }
 
     /// Safety: cur_wave must not be empty
     #[inline(always)]
-    unsafe fn retrieve_drum_data(cur_wave: &[i8], base_pos: u32x8) -> f32x8 {
+    unsafe fn retrieve_drum_data(cur_wave: &[f32], base_pos: u32x8) -> f32x8 {
         unsafe {
             let cmp = u32x8::splat(cur_wave.len() as u32 - 1);
             // Casting mask
             let in_bounds: f32x8 = core::mem::transmute(base_pos.simd_le(cmp));
-            let base_pos = base_pos.min(cmp).to_array();
-            let vals = f32x8::from(core::array::from_fn(|i| {
-                *cur_wave.get_unchecked(base_pos[i] as usize) as f32
-            }));
+            let base_pos = base_pos.min(cmp);
+            // Masked gather exists in avx2, but it was slightly slower in my benchmark.
+            let vals = gather(cur_wave, base_pos);
             in_bounds.blend(vals, f32x8::splat(0.0))
         }
     }
 
     impl OrgInterpolation for Linear {
         #[inline(always)]
-        fn wave_simd(wave: &[i8; 256], pos: u32x8, frac: f32x8) -> f32x8 {
+        fn wave_simd(wave: &[f32; 256], pos: u32x8, frac: f32x8) -> f32x8 {
             let wave_data1 = retrieve_wave_data(wave, pos);
             let wave_data2 = retrieve_wave_data(wave, pos + u32x8::splat(1));
             // Linear Interpolation
@@ -318,7 +332,7 @@ mod _interp_impls {
         }
 
         #[inline(always)]
-        unsafe fn drum_simd(drum: &[i8], pos: u32x8, frac: f32x8) -> f32x8 {
+        unsafe fn drum_simd(drum: &[f32], pos: u32x8, frac: f32x8) -> f32x8 {
             unsafe {
                 let wave_data1 = retrieve_drum_data(drum, pos);
                 let wave_data2 = retrieve_drum_data(drum, pos + u32x8::splat(1));
@@ -330,12 +344,12 @@ mod _interp_impls {
 
     impl OrgInterpolation for NoInterp {
         #[inline(always)]
-        fn wave_simd(wave: &[i8; 256], pos: u32x8, _frac: f32x8) -> f32x8 {
+        fn wave_simd(wave: &[f32; 256], pos: u32x8, _frac: f32x8) -> f32x8 {
             retrieve_wave_data(wave, pos)
         }
 
         #[inline(always)]
-        unsafe fn drum_simd(drum: &[i8], pos: u32x8, _frac: f32x8) -> f32x8 {
+        unsafe fn drum_simd(drum: &[f32], pos: u32x8, _frac: f32x8) -> f32x8 {
             unsafe { retrieve_drum_data(drum, pos) }
         }
     }
@@ -344,7 +358,7 @@ mod _interp_impls {
         const INTERP_REMNANT: u32 = 1;
 
         #[inline(always)]
-        fn wave_simd(wave: &[i8; 256], pos: u32x8, frac: f32x8) -> f32x8 {
+        fn wave_simd(wave: &[f32; 256], pos: u32x8, frac: f32x8) -> f32x8 {
             let s1 = retrieve_wave_data(wave, pos - u32x8::splat(1));
             let s2 = retrieve_wave_data(wave, pos);
             let s3 = retrieve_wave_data(wave, pos + u32x8::splat(1));
@@ -366,7 +380,7 @@ mod _interp_impls {
         }
 
         #[inline(always)]
-        unsafe fn drum_simd(drum: &[i8], pos: u32x8, frac: f32x8) -> f32x8 {
+        unsafe fn drum_simd(drum: &[f32], pos: u32x8, frac: f32x8) -> f32x8 {
             unsafe {
                 let s1 = retrieve_drum_data(drum, pos - u32x8::splat(1));
                 let s2 = retrieve_drum_data(drum, pos);
@@ -646,10 +660,9 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
                 debug_assert!((0..100).contains(&self.wave_idx));
                 let idx = self.wave_idx as usize * 256;
                 let w = a.wavetable().as_ptr();
-                core::slice::from_raw_parts(w.add(idx).cast(), 256)
+                core::slice::from_raw_parts(w.add(idx), 256)
             }
         };
-        debug_assert!((1..=500000).contains(&cur_wave.len()));
         let vol = self.cur_vol as i32;
         // Integer multiplication then float cast is slightly faster
         let left = ((self.cur_pan >> 4) as i32 * vol) as f32 * MASTER_VOLUME;
@@ -1207,8 +1220,8 @@ impl<I, A> OrgPlayBuilder<I, A> {
     /// See [`CaveStoryAssetProvider`] for more information.
     pub fn with_asset<'a>(
         self,
-        wavetable: &'a [u8; 25600],
-        drum: &'a [u8; 40000],
+        wavetable: &'a [wt; 25600],
+        drum: &'a [wt; 40000],
     ) -> OrgPlayBuilder<I, AssetByRef<'a>> {
         self.with_soundbank_provider(AssetByRef(wavetable, drum))
     }

@@ -3,9 +3,20 @@ use core::f32;
 use orgorg::{
     CaveStoryAssetProvider, OrgPlayBuilder,
     interp_impls::{Linear, NoInterp},
+    wt,
 };
 
 struct DummyProvider;
+
+const fn to_wt_array<const N: usize>(arr: [u8; N]) -> [wt; N] {
+    let mut a = [unsafe { core::mem::zeroed() }; N];
+    let mut i = 0;
+    while i < N {
+        a[i] = arr[i] as wt;
+        i += 1;
+    }
+    a
+}
 
 const fn generate_dummy_array<const N: usize>() -> [u8; N] {
     let mut ret = [0; N];
@@ -18,11 +29,11 @@ const fn generate_dummy_array<const N: usize>() -> [u8; N] {
 }
 
 impl CaveStoryAssetProvider for DummyProvider {
-    fn wavetable(&self) -> &[u8; 25600] {
-        &const { generate_dummy_array() }
+    fn wavetable(&self) -> &[wt; 25600] {
+        &const { to_wt_array(generate_dummy_array()) }
     }
-    fn drum(&self) -> &[u8; 40000] {
-        &const { generate_dummy_array() }
+    fn drum(&self) -> &[wt; 40000] {
+        &const { to_wt_array(generate_dummy_array()) }
     }
 }
 
