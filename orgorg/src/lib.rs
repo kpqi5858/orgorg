@@ -215,7 +215,7 @@ unsafe impl SoundbankProvider for Soundbank<'_> {
 ///
 /// Keep in mind that these functions are called at audio rate.
 /// You would like to put `#[inline]` and optimize them really well.
-/// It should be auto-vectorization friendly.
+/// Specifically, it should be auto-vectorization friendly.
 ///
 /// Implementer of `OrgInterpolation` must be ZST. Otherwise you will get compilation error.
 /// It is meant to be stateless.
@@ -237,9 +237,9 @@ pub trait OrgInterpolation {
     ///
     /// Out of bounds `drum` read should be 0.
     ///
-    /// If `drum.len()` is too big (Exact value is not specified, but not greater than
-    /// [`SoundbankProvider::get_drum`] requirement), it can produce incorrect result.
-    fn drum(drum: &[OrgSmp], pos: u32, frac: f32) -> f32;
+    /// # Safety
+    /// Length of `drum` must be in `[1, 500000]`.
+    unsafe fn drum(drum: &[OrgSmp], pos: u32, frac: f32) -> f32;
 }
 
 /// Builtin [`OrgInterpolation`] implementations.
@@ -331,7 +331,7 @@ mod _interp_impls {
         }
 
         #[inline(always)]
-        fn drum(drum: &[OrgSmp], pos: u32, frac: f32) -> f32 {
+        unsafe fn drum(drum: &[OrgSmp], pos: u32, frac: f32) -> f32 {
             let sample1 = drum.get_or_zero(pos);
             let sample2 = drum.get_or_zero(pos.wrapping_add(1));
             (sample2 - sample1).fma(frac, sample1)
@@ -345,7 +345,7 @@ mod _interp_impls {
         }
 
         #[inline(always)]
-        fn drum(drum: &[OrgSmp], pos: u32, _frac: f32) -> f32 {
+        unsafe fn drum(drum: &[OrgSmp], pos: u32, _frac: f32) -> f32 {
             drum.get_or_zero(pos)
         }
     }
@@ -378,7 +378,7 @@ mod _interp_impls {
         }
 
         #[inline(always)]
-        fn drum(drum: &[OrgSmp], pos: u32, frac: f32) -> f32 {
+        unsafe fn drum(drum: &[OrgSmp], pos: u32, frac: f32) -> f32 {
             #[rustfmt::skip]
             let idx = [
                 pos.wrapping_sub(1),
