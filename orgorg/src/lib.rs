@@ -419,7 +419,7 @@ mod _interp_impls {
         #[inline(always)]
         fn drum(drum: &[i8], pos: u32, frac: f32) -> f32 {
             let sample1 = drum.get(pos as usize).copied().unwrap_or(0);
-            let sample2 = drum.get(pos as usize + 1).copied().unwrap_or(0);
+            let sample2 = drum.get(pos.wrapping_add(1) as usize).copied().unwrap_or(0);
             sample1 as f32 + ((sample2 as i32) - (sample1 as i32)) as f32 * frac
         }
     }
@@ -445,8 +445,8 @@ mod _interp_impls {
             let idx = [
                 pos.wrapping_sub(1) as usize & 0xff,
                 pos                 as usize & 0xff,
-                pos.wrapping_sub(1) as usize & 0xff,
-                pos.wrapping_sub(2) as usize & 0xff,
+                pos.wrapping_add(1) as usize & 0xff,
+                pos.wrapping_add(2) as usize & 0xff,
             ];
             let s1 = wave[idx[0]] as f32;
             let s2 = wave[idx[1]] as f32;
@@ -467,8 +467,8 @@ mod _interp_impls {
             let idx = [
                 pos.wrapping_sub(1) as usize,
                 pos                 as usize,
-                pos.wrapping_sub(1) as usize,
-                pos.wrapping_sub(2) as usize,
+                pos.wrapping_add(1) as usize,
+                pos.wrapping_add(2) as usize,
             ];
             let s1 = drum.get(idx[0]).copied().unwrap_or(0) as f32;
             let s2 = drum.get(idx[1]).copied().unwrap_or(0) as f32;
