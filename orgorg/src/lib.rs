@@ -290,6 +290,9 @@ mod _interp_impls {
             let len = self.len() as u32 - 1;
             let cond = 0_u32.wrapping_sub((idx <= len) as u32);
             let actual_idx = idx.min(len);
+            // https://github.com/llvm/llvm-project/issues/163023
+            // Missed optimization with `zext nneg` index then gather
+            // This emits two vgatherqd instructions, not ideal single vgatherdd.
             let value = unsafe { *self.get_unchecked(actual_idx as usize) };
             f32::from_bits(value.to_bits() & cond)
         }
