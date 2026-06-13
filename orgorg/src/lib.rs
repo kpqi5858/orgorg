@@ -12,9 +12,9 @@
 //! // Basic example for playing Org-02 music with original Cave Story drum sound effects.
 //! use orgorg::{OrgPlay, OrgPlayBuilder, AssetByRef, interp_impls::Linear};
 //!
-//! let wavetable: &[i8; 25600] = todo!();
-//! let drum: &[i8; 40000] = todo!();
-//! let org: &[u8] = todo!();
+//! let wavetable = todo!();
+//! let drum = todo!();
+//! let org = todo!();
 //!
 //! let mut player: OrgPlay<'_, Linear, AssetByRef<'_>> = OrgPlayBuilder::new()
 //!     .with_sample_rate(44100)
@@ -267,7 +267,6 @@ impl FmaUtils for f32 {
     fn fma(self, a: f32, b: f32) -> f32 {
         #[cfg(feature = "fma")]
         return self.mul_add(a, b);
-        // This is non-deterministic though. It's up to llvm.
         #[cfg(feature = "fma-nightly")]
         return core::f32::math::mul_add(self, a, b);
         return (self * a) + b;
@@ -1121,5 +1120,53 @@ where
     /// Returns None if song is invalid.
     pub fn build<'a>(self, song: &'a [u8]) -> Option<OrgPlay<'a, I, A>> {
         OrgPlay::<I, A>::new(self.1, song, self.2)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    extern crate std;
+
+    #[test]
+    fn inst_loop() {
+        let mut inst = Instrument::<false> {
+            tuning: 0,
+            pi: false,
+            n_events: 4,
+            cur_event: 0,
+            loop_event: 0,
+            phase_inc: 0,
+            phase_acc: 0,
+            cur_pan: 0,
+            cur_vol: 0,
+            wave_idx: 0,
+            cur_len_or_phase_acc: 0,
+        };
+
+        let notes: [u32; 4] = [0, 1, 2, 3];
+        inst.calculate_loop(0, unsafe {
+            NonNull::new_unchecked(notes.as_ptr() as *const u8 as *mut u8)
+        });
+        assert_eq!(inst.loop_event, 0);
+
+        let notes: [u32; 4] = [0, 1, 2, 3];
+        inst.calculate_loop(4, unsafe {
+            NonNull::new_unchecked(notes.as_ptr() as *const u8 as *mut u8)
+        });
+        assert_eq!(inst.loop_event, 3);
+
+        let notes: [u32; 4] = [0, 2, 4, 6];
+        inst.calculate_loop(3, unsafe {
+            NonNull::new_unchecked(notes.as_ptr() as *const u8 as *mut u8)
+        });
+        assert_eq!(inst.loop_event, 2);
+
+        let notes: [u32; 4] = [0, 2, 4, 6];
+        inst.calculate_loop(2, unsafe {
+            NonNull::new_unchecked(notes.as_ptr() as *const u8 as *mut u8)
+        });
+        assert_eq!(inst.loop_event, 1);
     }
 }
