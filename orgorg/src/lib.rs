@@ -512,7 +512,7 @@ impl<const DRUM: bool> Instrument<DRUM> {
         self.cur_event = 0;
     }
 
-    fn tick(&mut self, cur_beat: u32, loop_start: u32, rate: u32, ptr: NonNull<u8>) {
+    fn tick(&mut self, cur_beat: u32, loop_start: u32, rate_recip: f32, ptr: NonNull<u8>) {
         // There is no official documentation for .org file,
         // and these logics are not designed to handle it as leniently as possible.
         // It assumes that event is sorted by its beat, and no more event after loop_end.
@@ -558,8 +558,8 @@ impl<const DRUM: bool> Instrument<DRUM> {
         if event.note != 255 {
             self.cur_len_or_phase_acc = 0;
             self.phase_acc = 0;
-            fn calc_inc(freq: u32, rate: u32) -> Option<u32> {
-                let res = (freq as i32 as f32) / (rate as i32 as f32);
+            fn calc_inc(freq: u32, rate_recip: f32) -> Option<u32> {
+                let res = (freq as i32 as f32) * rate_recip;
                 if res >= 256.0 {
                     None
                 } else {
@@ -572,7 +572,7 @@ impl<const DRUM: bool> Instrument<DRUM> {
             }
             if DRUM {
                 let freq = event.note as u32 * 800 + 100;
-                if let Some(inc) = calc_inc(freq, rate) {
+                if let Some(inc) = calc_inc(freq, rate_recip) {
                     self.phase_inc = inc;
                 }
             } else {
@@ -581,7 +581,7 @@ impl<const DRUM: bool> Instrument<DRUM> {
                 let freq = FRQ_TABLE[(event.note % 12) as usize];
                 let oct = 1 << (5 + (event.note / 12).min(7) as i32);
                 let final_freq = (freq * oct) + (self.tuning - 1000) as i32;
-                let phase_inc = calc_inc(final_freq as u32, rate);
+                let phase_inc = calc_inc(final_freq as u32, rate_recip);
                 if let Some(inc) = phase_inc {
                     self.phase_inc = inc;
                     self.cur_len_or_phase_acc = if self.pi {
@@ -730,7 +730,7 @@ impl PlayResult {
 pub struct OrgPlay<'a, I: OrgInterpolation, A: SoundbankProvider> {
     song_data: NonNull<u8>,
     _song_data_ref: PhantomData<&'a [u8]>,
-    sample_rate: u32,
+    sample_rate_recip: f32,
     samples_per_beat: i32,
     remaining_samples: i32,
     loop_start: u32,
@@ -797,6 +797,8 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
             return None;
         }
 
+        let rate_recip = 1.0 / rate as i32 as f32;
+
         let mut offset = 18;
         let mut ins_data_offset = 114;
 
@@ -834,7 +836,7 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
             if valid_wave {
                 ret.calculate_loop(loop_start, inst_data_ptr);
                 // Initial ticking for beat 0, since synth function will start ticking at beat 1
-                ret.tick(0, loop_start, rate, inst_data_ptr);
+                ret.tick(0, loop_start, rate_recip, inst_data_ptr);
             } else {
                 ret.loop_event = u16::MAX;
                 ret.cur_event = u16::MAX;
@@ -872,7 +874,7 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
             if valid_wave {
                 ret.calculate_loop(loop_start, inst_data_ptr);
                 // Initial ticking for beat 0, since synth function will start ticking at beat 1
-                ret.tick(0, loop_start, rate, inst_data_ptr);
+                ret.tick(0, loop_start, rate_recip, inst_data_ptr);
             } else {
                 ret.loop_event = u16::MAX;
                 ret.cur_event = u16::MAX;
@@ -891,7 +893,7 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
 
         Some(Self {
             song_data,
-            sample_rate: rate,
+            sample_rate_recip: rate_recip,
             samples_per_beat,
             remaining_samples: samples_per_beat,
             loop_start,
@@ -977,11 +979,11 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
                 }
                 let mut ptr = self.song_data;
                 for w in &mut self.wave_ins {
-                    w.tick(self.cur_beat, self.loop_start, self.sample_rate, ptr);
+                    w.tick(self.cur_beat, self.loop_start, self.sample_rate_recip, ptr);
                     ptr = unsafe { ptr.add(w.n_events as usize * 8) };
                 }
                 for w in &mut self.drum_ins {
-                    w.tick(self.cur_beat, self.loop_start, self.sample_rate, ptr);
+                    w.tick(self.cur_beat, self.loop_start, self.sample_rate_recip, ptr);
                     ptr = unsafe { ptr.add(w.n_events as usize * 8) };
                 }
                 match till {
