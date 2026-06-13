@@ -540,7 +540,6 @@ use _simd::{F24, I24MASK, cold_path};
 
 impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
     // Safety: cur_event < n_events
-    #[inline]
     unsafe fn get_cur_event_beat(&self) -> u32 {
         debug_assert!(self.cur_event < self.n_events);
         // Safety: See inst_data_ptr field comment
@@ -553,7 +552,6 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
     }
 
     // Safety: cur_event < n_events
-    #[inline]
     unsafe fn get_cur_event(&self) -> Event {
         debug_assert!(self.cur_event < self.n_events);
         // Safety: See inst_data_ptr field comment
@@ -577,7 +575,7 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
 
     fn tick<A: SoundbankProvider>(
         &mut self,
-        (cur_beat, loop_start, samples_per_beat, rate, sound): &(u32, u32, f32, u32, &A),
+        (cur_beat, loop_start, rate, sound): (u32, u32, u32, &A),
     ) {
         // There is no official documentation for .org file,
         // and these logics are not designed to handle it as leniently as possible.
@@ -593,13 +591,16 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
                 self.loop_event = Some(self.cur_event);
             }
         }
+        if !DRUM && !self.pi {
+            self.cur_len = self.cur_len.saturating_sub(1);
+        }
         if self.cur_event >= self.n_events {
             return;
         }
         // Safety: Checked with above code
         let event = unsafe {
             let cur_event_beat = self.get_cur_event_beat();
-            if cur_event_beat == *cur_beat {
+            if cur_event_beat == cur_beat {
                 self.get_cur_event()
             } else {
                 return;
@@ -626,7 +627,7 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
             self.phase_acc = 0;
             self.phase_acc_sub = AccTy::default();
             self.cur_len = 0;
-            let rate = *rate as f32;
+            let rate = rate as f32;
             if DRUM {
                 // Safety: See wave_idx field comment
                 let wave_len = unsafe { sound.get_drum(self.wave_idx).len() };
@@ -676,7 +677,7 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
                         // But I think this is incorrect
                         (1024.0 / phase_inc) as u32
                     } else {
-                        (event.length as f32 * samples_per_beat) as u32
+                        event.length as u32
                     };
                 }
             }
@@ -715,11 +716,11 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
         let right = ((self.cur_pan & 0b00001111) as i32 * vol) as f32 * MASTER_VOLUME;
         let mono = (((self.cur_pan >> 4) + (self.cur_pan & 0b00001111)) as i32 * vol) as f32
             * (MASTER_VOLUME / 2.0);
-        let n = match (DRUM, MONO) {
-            (true, true) => buf.len(),
-            (true, false) => buf.len() / 2,
-            (false, true) => cmp::min(buf.len(), self.cur_len as usize),
-            (false, false) => cmp::min(buf.len() / 2, self.cur_len as usize),
+        let n = match (DRUM, MONO, self.pi) {
+            (true, true, _) | (false, true, false) => buf.len(),
+            (true, false, _) | (false, false, false) => buf.len() / 2,
+            (false, true, true) => cmp::min(buf.len(), self.cur_len as usize),
+            (false, false, true) => cmp::min(buf.len() / 2, self.cur_len as usize),
         };
         #[cfg(feature = "simd")]
         {
@@ -739,10 +740,6 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
 
                 for i in 0..simd_path_cnt {
                     let result = if !DRUM {
-                        // This compiles to (in my machine):
-                        // - 2x loop unroll
-                        // - simd_path_rem == 0 path
-                        // - simd_path_rem != 0 path
                         let lane: u32x8 = [0, 1, 2, 3, 4, 5, 6, 7].into();
                         let base_pos_fp = lane * u32x8::splat(wave_inc) + u32x8::splat(pos.0);
                         let base_pos = base_pos_fp >> 24;
@@ -757,13 +754,9 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
                         }
                         I::wave_simd(cur_wave.try_into().unwrap_unchecked(), base_pos, sub_frac)
                     } else {
-                        // But this, does not get loop unroll and separate simd_path_rem != 0 path
-                        // Might be that this is more complex and involved than upper !DRUM code.
                         let lane: u32x8 = [0, 1, 2, 3, 4, 5, 6, 7].into();
                         let base_pos = u32x8::splat(pos.0) + lane * u32x8::splat(inc_i);
-                        // Using fixed point here as well is faster.
-                        // Though highest drum note at sample rate below
-                        // 2379Hz (76100 / Rate * 8 < 256) will produce incorrect result.
+                        // Using fixed point here as well is slightly faster.
                         let sub_pos = lane * u32x8::splat(inc_sub_24) + u32x8::splat(pos_sub);
                         let sub_pos_i = sub_pos >> 24;
                         let sub_pos_f: i32x8 =
@@ -853,7 +846,7 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
 
                 self.phase_acc = pos.0;
                 self.phase_acc_sub = pos_sub;
-                if !DRUM {
+                if !DRUM && self.pi {
                     self.cur_len -= n as u32;
                 }
             }
@@ -907,7 +900,7 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
             }
             self.phase_acc = pos.0;
             self.phase_acc_sub = pos_sub;
-            if !DRUM {
+            if !DRUM && self.pi {
                 self.cur_len -= n as u32;
             }
         }
@@ -992,7 +985,7 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
         if song.len() < 114 {
             return None;
         }
-        // Safety: all following read is index <= 114
+        // Safety: all following read is within index < 114
         let song_reader = unsafe { UnsafeReader::new(song) };
         if !matches!(&song[0..6], b"Org-02" | b"Org-03") {
             return None;
@@ -1010,7 +1003,7 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
 
         let mut offset = 18;
         let mut ins_data_offset = 114;
-        let tick_args = &(0, loop_start, samples_per_beat, rate, &asset);
+        let tick_args = (0, loop_start, rate, &asset);
 
         // core::array really needs try_from_fn, or array::try_map
         // Instrument does not allocate anything so no risk of memory leak when early returns.
@@ -1180,12 +1173,9 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
                 } else {
                     looped = false;
                 }
-                // Since they don't change, making and passing a reference to the tuple is
-                // slightly faster than passing individual arguments.
-                let tick_args = &(
+                let tick_args = (
                     self.cur_beat,
                     self.loop_start,
-                    self.samples_per_beat,
                     self.sample_rate,
                     &self.asset,
                 );
