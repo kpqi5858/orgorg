@@ -46,4 +46,5 @@ fn main() {
     let elapsed = cur.elapsed().as_secs_f64();
     println!("{:.2}", elapsed);
     println!("{:.0} MB/s", goal as f64 / elapsed * 4.0 / 1024.0 / 1024.0);
+    println!("{:.2}x", (goal as f64 / 48000.0 / 2.0) / elapsed);
 }
