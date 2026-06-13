@@ -351,13 +351,8 @@ struct Event {
     panning: u8,
 }
 
-struct Instrument<'a, I: OrgInterpolation, const DRUM: bool> {
-    // Invariants:
-    // - If n_events is 0, this pointer can be dangling so never access it
-    // - else, this is a start of &'a [u8] with length of n_events * 8
-    // Raw pointer to save a usize space over slice here.
-    inst_data_ptr: NonNull<u8>,
-    tuning: i16,
+struct Instrument<const DRUM: bool> {
+    tuning: u16,
     pi: bool,
     // Supposedly the maximum number of events in a single instrument is 256.
     // Some incompatible(non-standard?) music can exceed that arbitrary limit.
@@ -367,50 +362,38 @@ struct Instrument<'a, I: OrgInterpolation, const DRUM: bool> {
     // TODO: Pre-calculate this value, not on the fly
     loop_event: Option<u16>,
     phase_inc: u32,
-    // In `simd` and non-DRUM, this is 8.24 phase accumulator. phase_acc_sub is not used.
     phase_acc: u32,
-    phase_acc_sub: u32,
     cur_pan: u8,
     cur_vol: u8,
     // Invariants:
     // - If n_events != 0, must point to valid wave
     wave_idx: u8,
-    // DRUM: 8. part
-    cur_len: u32,
-    _i: PhantomData<I>,
-    _a: PhantomData<&'a [u8]>,
+    cur_len_or_phase_acc: u32,
 }
 
-unsafe impl<'a, I: OrgInterpolation, const DRUM: bool> Send for Instrument<'a, I, DRUM> {}
-unsafe impl<'a, I: OrgInterpolation, const DRUM: bool> Sync for Instrument<'a, I, DRUM> {}
+unsafe impl<const DRUM: bool> Send for Instrument<DRUM> {}
+unsafe impl<const DRUM: bool> Sync for Instrument<DRUM> {}
 
 // 8.24 fixed point arithmetic
 pub const I24: u32 = 0x1000000;
 pub const I24MASK: u32 = I24 - 1;
 pub const F24: f32 = I24 as f32;
 
-impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
+impl<const DRUM: bool> Instrument<DRUM> {
     // Safety: cur_event < n_events
-    unsafe fn get_cur_event_beat(&self) -> u32 {
+    unsafe fn get_cur_event_beat(&self, ptr: NonNull<u8>) -> u32 {
         debug_assert!(self.cur_event < self.n_events);
         // Safety: See inst_data_ptr field comment
-        unsafe {
-            self.inst_data_ptr
-                .add(self.cur_event as usize * 4)
-                .cast()
-                .read_unaligned()
-        }
+        unsafe { ptr.add(self.cur_event as usize * 4).cast().read_unaligned() }
     }
 
     // Safety: cur_event < n_events
-    unsafe fn get_cur_event(&self) -> Event {
+    unsafe fn get_cur_event(&self, ptr: NonNull<u8>) -> Event {
         debug_assert!(self.cur_event < self.n_events);
         // Safety: See inst_data_ptr field comment
         unsafe {
             let n_events = self.n_events as usize;
-            let inst_ptr = self
-                .inst_data_ptr
-                .add(n_events * 4 + self.cur_event as usize);
+            let inst_ptr = ptr.add(n_events * 4 + self.cur_event as usize);
             let note = inst_ptr.read();
             let length = inst_ptr.add(n_events).read();
             let volume = inst_ptr.add(n_events * 2).read();
@@ -424,10 +407,7 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
         }
     }
 
-    fn tick<A: SoundbankProvider>(
-        &mut self,
-        (cur_beat, loop_start, rate, sound): (u32, u32, u32, &A),
-    ) {
+    fn tick(&mut self, cur_beat: u32, loop_start: u32, rate: u32, ptr: NonNull<u8>) {
         // There is no official documentation for .org file,
         // and these logics are not designed to handle it as leniently as possible.
         // It assumes that event is sorted by its beat, and no more event after loop_end.
@@ -443,16 +423,16 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
             }
         }
         if !DRUM && !self.pi {
-            self.cur_len = self.cur_len.saturating_sub(1);
+            self.cur_len_or_phase_acc = self.cur_len_or_phase_acc.saturating_sub(1);
         }
         if self.cur_event >= self.n_events {
             return;
         }
         // Safety: Checked with above code
         let event = unsafe {
-            let cur_event_beat = self.get_cur_event_beat();
+            let cur_event_beat = self.get_cur_event_beat(ptr);
             if cur_event_beat == cur_beat {
-                self.get_cur_event()
+                self.get_cur_event(ptr)
             } else {
                 return;
             }
@@ -475,46 +455,37 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
             self.cur_pan = LUT[event.panning.min(12) as usize];
         }
         if event.note != 255 {
+            self.cur_len_or_phase_acc = 0;
             self.phase_acc = 0;
-            self.phase_acc_sub = 0;
-            self.cur_len = 0;
-            let rate = rate as f32;
-            if DRUM {
-                // Safety: See wave_idx field comment
-                let wave_len = unsafe { sound.get_drum(self.wave_idx).len() };
-                let phase_inc = (event.note as i32 * 800 + 100) as f32 / rate;
-                // This is needed for OrgInterpolation trait invariant.
-                // And if this condition is false, then the pitch isn't in RATE at all.
-                let in_pitch = phase_inc.is_finite() && (0.0..wave_len as f32).contains(&phase_inc);
-                if in_pitch {
+            fn calc_inc(freq: u32, rate: u32) -> Option<u32> {
+                let res = (freq as i32 as f32) / (rate as i32 as f32);
+                if res >= 256.0 {
+                    None
+                } else {
                     unsafe {
-                        let i = phase_inc.to_int_unchecked::<i32>();
-                        let i_sub = phase_inc - i as f32;
-                        self.cur_len = i as u32;
-                        self.phase_inc = (i_sub * F24).to_int_unchecked::<i32>() as u32;
+                        let i = res.to_int_unchecked::<i32>() as u32;
+                        let sub = res - i as f32;
+                        Some((i << 24) | (sub * F24).to_int_unchecked::<i32>() as u32)
                     }
                 }
+            }
+            if DRUM {
+                let freq = event.note as u32 * 800 + 100;
+                if let Some(inc) = calc_inc(freq, rate) {
+                    self.phase_inc = inc;
+                }
             } else {
-                const FRQ_TABLE: [i32; 12] =
+                const FRQ_TABLE: [u32; 12] =
                     [262, 277, 294, 311, 330, 349, 370, 392, 415, 440, 466, 494];
                 let freq = FRQ_TABLE[(event.note % 12) as usize];
                 let oct = 1 << (5 + (event.note / 12).min(7) as i32);
-                let final_freq = (freq * oct) + (self.tuning as i32 - 1000);
-                let phase_inc = final_freq as f32 / rate;
-                // This is needed for OrgInterpolation trait invariant.
-                // And if this condition is false, then the pitch isn't in RATE at all.
-                let in_pitch = phase_inc.is_finite() && (0.0..256.0).contains(&phase_inc);
-                if in_pitch {
-                    unsafe {
-                        let i = phase_inc.to_int_unchecked::<i32>();
-                        let i_sub = phase_inc - i as f32;
-                        let v = (i << 24) | (i_sub * F24).to_int_unchecked::<i32>();
-                        self.phase_inc = v as u32;
-                    };
-                    self.cur_len = if self.pi {
-                        // TODO: I don't know what is the accurate formula for "pi" instrument
-                        // But I think this is incorrect
-                        (1024.0 / phase_inc) as u32
+                let final_freq = (freq * oct) + (self.tuning as u32 - 1000);
+                let phase_inc = calc_inc(final_freq, rate);
+                if let Some(inc) = phase_inc {
+                    self.phase_inc = inc;
+                    self.cur_len_or_phase_acc = if self.pi {
+                        // TODO: I dont know what is the accurate formula for pi instrument
+                        (oct + 1) * 4 * 256
                     } else {
                         event.length as u32
                     };
@@ -524,11 +495,15 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
     }
 
     // This function is the critical part of overall performance.
-    fn fill_buf<A: SoundbankProvider, const MONO: bool>(&mut self, buf: &mut [f32], a: &A) {
-        if !DRUM && self.cur_len == 0 {
+    fn fill_buf<A: SoundbankProvider, I: OrgInterpolation, const MONO: bool>(
+        &mut self,
+        buf: &mut [f32],
+        a: &A,
+    ) {
+        if !DRUM && self.cur_len_or_phase_acc == 0 {
             return;
         }
-        if DRUM && self.cur_len | self.phase_inc == 0 {
+        if DRUM && self.phase_inc == 0 {
             return;
         }
         // Safety: See wave_idx field comment
@@ -553,20 +528,20 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
         let n = match (MONO, self.pi) {
             (true, false) => buf.len(),
             (false, false) => buf.len() / 2,
-            (true, true) => cmp::min(buf.len(), self.cur_len as usize),
-            (false, true) => cmp::min(buf.len() / 2, self.cur_len as usize),
+            (true, true) => cmp::min(buf.len(), self.cur_len_or_phase_acc as usize),
+            (false, true) => cmp::min(buf.len() / 2, self.cur_len_or_phase_acc as usize),
         };
         let buf = unsafe {
             let n_len = if MONO { n } else { n * 2 };
             buf.get_unchecked_mut(0..n_len)
         };
 
-        let inc_i = self.cur_len;
+        let inc_i = self.cur_len_or_phase_acc >> 24;
         let wave_inc = self.phase_inc;
-        let inc_sub_24 = self.phase_inc;
+        let inc_sub_24 = self.phase_inc & I24MASK;
 
         let mut pos = Wrapping(self.phase_acc);
-        let mut pos_sub = self.phase_acc_sub;
+        let mut pos_sub = self.cur_len_or_phase_acc;
 
         for chunk in buf.chunks_mut(if MONO { 256 } else { 512 }) {
             for chunk in chunk.chunks_exact_mut(if MONO { 1 } else { 2 }) {
@@ -602,7 +577,6 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
                 pos += pos_sub >> 24;
                 pos_sub &= I24MASK;
                 if pos.0 >= cur_wave.len() as u32 + I::INTERP_REMNANT {
-                    self.cur_len = 0;
                     self.phase_inc = 0;
                     return;
                 }
@@ -610,9 +584,9 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
         }
 
         self.phase_acc = pos.0;
-        self.phase_acc_sub = pos_sub;
+        self.cur_len_or_phase_acc = pos_sub;
         if !DRUM && self.pi {
-            self.cur_len -= n as u32;
+            self.cur_len_or_phase_acc -= n as u32;
         }
     }
 }
@@ -651,16 +625,22 @@ impl PlayResult {
 
 /// `no_std` compatible Cave Story Organya Music Player.
 pub struct OrgPlay<'a, I: OrgInterpolation, A: SoundbankProvider> {
+    song_data: NonNull<u8>,
+    _song_data_ref: PhantomData<&'a [u8]>,
     sample_rate: u32,
     samples_per_beat: i32,
     remaining_samples: i32,
     loop_start: u32,
     loop_end: u32,
     cur_beat: u32,
-    wave_ins: [Instrument<'a, I, false>; 8],
-    drum_ins: [Instrument<'a, I, true>; 8],
+    wave_ins: [Instrument<false>; 8],
+    drum_ins: [Instrument<true>; 8],
     asset: A,
+    _i: PhantomData<I>,
 }
+
+unsafe impl<'a, I: OrgInterpolation, A: SoundbankProvider + Send> Send for OrgPlay<'a, I, A> {}
+unsafe impl<'a, I: OrgInterpolation, A: SoundbankProvider + Sync> Sync for OrgPlay<'a, I, A> {}
 
 impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
     fn new(asset: A, song: &'a [u8], rate: u32) -> Option<Self> {
@@ -676,10 +656,6 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
 
             fn read_u8(&self, offset: usize) -> u8 {
                 self.read::<1>(offset)[0]
-            }
-
-            fn read_i16(&self, offset: usize) -> i16 {
-                i16::from_le_bytes(self.read(offset))
             }
 
             fn read_u16(&self, offset: usize) -> u16 {
@@ -716,7 +692,6 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
 
         let mut offset = 18;
         let mut ins_data_offset = 114;
-        let tick_args = (0, loop_start, rate, &asset);
 
         // core::array really needs try_from_fn, or array::try_map
         // Instrument does not allocate anything so no risk of memory leak when early returns.
@@ -737,24 +712,20 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
                 unsafe { NonNull::new_unchecked(inst_data.as_ptr() as *mut u8) }
             };
             let mut ret = Instrument {
-                inst_data_ptr,
-                tuning: song_reader.read_i16(offset),
+                tuning: song_reader.read_u16(offset),
                 pi,
                 n_events: if valid_wave { n_events } else { 0 }, // Must be 0 for invalid wave
                 phase_inc: 0,
                 phase_acc: 0,
-                phase_acc_sub: 0,
                 cur_pan: 0,
                 cur_vol: 0,
-                cur_len: 0,
+                cur_len_or_phase_acc: 0,
                 cur_event: 0,
                 loop_event: None,
                 wave_idx: wave,
-                _i: PhantomData,
-                _a: PhantomData,
             };
             // Initial ticking for beat 0, since synth function will start ticking at beat 1
-            ret.tick(tick_args);
+            ret.tick(0, loop_start, rate, inst_data_ptr);
             offset += 6;
             ins_data_offset += n_events as usize * 8;
             val.write(ret);
@@ -773,24 +744,20 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
                 unsafe { NonNull::new_unchecked(inst_data.as_ptr() as *mut u8) }
             };
             let mut ret = Instrument {
-                inst_data_ptr,
-                tuning: song_reader.read_i16(offset),
+                tuning: song_reader.read_u16(offset),
                 pi,
                 n_events: if valid_wave { n_events } else { 0 }, // Must be 0 for invalid wave
                 phase_inc: 0,
                 phase_acc: 0,
-                phase_acc_sub: 0,
                 cur_pan: 0,
                 cur_vol: 0,
-                cur_len: 0,
+                cur_len_or_phase_acc: 0,
                 cur_event: 0,
                 loop_event: None,
                 wave_idx: wave,
-                _i: PhantomData,
-                _a: PhantomData,
             };
             // Initial ticking for beat 0, since synth function will start ticking at beat 1
-            ret.tick(tick_args);
+            ret.tick(0, loop_start, rate, inst_data_ptr);
             offset += 6;
             ins_data_offset += n_events as usize * 8;
             val.write(ret);
@@ -801,7 +768,10 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
             return None;
         }
 
+        let song_data = unsafe { NonNull::new_unchecked(song.as_ptr() as *mut u8).add(114) };
+
         Some(Self {
+            song_data,
             sample_rate: rate,
             samples_per_beat,
             remaining_samples: samples_per_beat,
@@ -811,18 +781,18 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
             // Safety: They are all initialized now.
             // TODO: Switch to array_assume_init when it lands
             wave_ins: unsafe {
-                core::mem::transmute::<
-                    [MaybeUninit<Instrument<'a, I, false>>; 8],
-                    [Instrument<'a, I, false>; 8],
-                >(wave_ins)
+                core::mem::transmute::<[MaybeUninit<Instrument<false>>; 8], [Instrument<false>; 8]>(
+                    wave_ins,
+                )
             },
             drum_ins: unsafe {
-                core::mem::transmute::<
-                    [MaybeUninit<Instrument<'a, I, true>>; 8],
-                    [Instrument<'a, I, true>; 8],
-                >(drum_ins)
+                core::mem::transmute::<[MaybeUninit<Instrument<true>>; 8], [Instrument<true>; 8]>(
+                    drum_ins,
+                )
             },
             asset,
+            _song_data_ref: PhantomData,
+            _i: PhantomData,
         })
     }
 
@@ -886,17 +856,14 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
                 } else {
                     looped = false;
                 }
-                let tick_args = (
-                    self.cur_beat,
-                    self.loop_start,
-                    self.sample_rate,
-                    &self.asset,
-                );
+                let mut ptr = self.song_data;
                 for w in &mut self.wave_ins {
-                    w.tick(tick_args);
+                    w.tick(self.cur_beat, self.loop_start, self.sample_rate, ptr);
+                    ptr = unsafe { ptr.add(w.n_events as usize * 8) };
                 }
                 for w in &mut self.drum_ins {
-                    w.tick(tick_args);
+                    w.tick(self.cur_beat, self.loop_start, self.sample_rate, ptr);
+                    ptr = unsafe { ptr.add(w.n_events as usize * 8) };
                 }
                 match till {
                     PlayTill::Endless => {}
@@ -936,10 +903,10 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
             // Seems compiler can't prove that no out of bounds will happen here as well.
             let fill_buffer = unsafe { buf.get_unchecked_mut(from_raw..from_raw + to_fill_raw) };
             for w in &mut self.wave_ins {
-                w.fill_buf::<A, MONO>(fill_buffer, &self.asset);
+                w.fill_buf::<A, I, MONO>(fill_buffer, &self.asset);
             }
             for w in &mut self.drum_ins {
-                w.fill_buf::<A, MONO>(fill_buffer, &self.asset);
+                w.fill_buf::<A, I, MONO>(fill_buffer, &self.asset);
             }
             filled_raw += to_fill_raw;
             // Same thing probably applies here
