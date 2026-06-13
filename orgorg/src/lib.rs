@@ -122,17 +122,6 @@ pub unsafe trait SoundbankProvider {
     /// Caller must not call this function
     /// if [`SoundbankProvider::is_drum_valid`] with given `idx` would return `false`.
     unsafe fn get_drum(&self, idx: u8) -> &[i8];
-
-    /// Get drum sample of `idx`, returning `None` if invalid.
-    #[inline]
-    fn get_drum_checked(&self, idx: u8) -> Option<&[i8]> {
-        if self.is_drum_valid(idx) {
-            // Safety: Just checked it's valid
-            Some(unsafe { self.get_drum(idx) })
-        } else {
-            None
-        }
-    }
 }
 
 // Safety: All function is consistent.
