@@ -77,6 +77,7 @@
 use core::{cmp, marker::PhantomData, mem::MaybeUninit, num::Wrapping, ptr::NonNull};
 
 const MASTER_VOLUME: f32 = 1.0 / (1 << 19) as f32;
+const MAX_DRUM_LEN: usize = 500000;
 
 /// Type of drums and wavetable data.
 #[cfg(feature = "f32smp")]
@@ -203,7 +204,7 @@ unsafe impl SoundbankProvider for Soundbank<'_> {
     #[inline(always)]
     fn is_drum_valid(&self, idx: u8) -> bool {
         let len = self.drums.get(idx as usize).map(|x| x.len()).unwrap_or(0);
-        (1..=500000).contains(&len)
+        (1..=MAX_DRUM_LEN).contains(&len)
     }
 
     #[inline(always)]
@@ -238,9 +239,9 @@ pub trait OrgInterpolation {
     ///
     /// Out of bounds `drum` read should be 0.
     ///
-    /// # Safety
-    /// Length of `drum` must be in `[1, 500000]`.
-    unsafe fn drum(drum: &[OrgSmp], pos: u32, frac: f32) -> f32;
+    /// Note that length of `drum` should be in `[1, 500000]` and [`OrgPlay`] will ensure that.
+    /// Implementations in [`interp_impls`] assume it and will return `0.0` if violated.
+    fn drum(drum: &[OrgSmp], pos: u32, frac: f32) -> f32;
 }
 
 /// Builtin [`OrgInterpolation`] implementations.
@@ -274,6 +275,8 @@ impl FmaUtils for f32 {
 }
 
 mod _interp_impls {
+    use crate::MAX_DRUM_LEN;
+
     use super::FmaUtils;
     use super::OrgInterpolation;
     use super::OrgSmp;
@@ -281,22 +284,25 @@ mod _interp_impls {
 
     // Auto-vectorization friendly getter
     trait GatherUtils {
-        // Safety: Length is in [1, 500000]
-        unsafe fn get_or_zero(&self, idx: u32) -> f32;
+        fn get_or_zero(&self, idx: u32) -> f32;
         // Safety: In bounds
         unsafe fn get_as_f32(&self, idx: u32) -> f32;
     }
 
     impl GatherUtils for [f32] {
         #[inline(always)]
-        unsafe fn get_or_zero(&self, idx: u32) -> f32 {
+        fn get_or_zero(&self, idx: u32) -> f32 {
+            // This check will be optimized out.
+            if !(1..=MAX_DRUM_LEN).contains(&self.len()) {
+                return 0.0;
+            }
             let len = self.len() as u32 - 1;
             let cond = 0_u32.wrapping_sub((idx <= len) as u32);
             let actual_idx = idx.min(len);
             // https://github.com/llvm/llvm-project/issues/163023
             // Missed optimization with `zext nneg` index then gather
             // This emits two vgatherqd instructions, not ideal single vgatherdd.
-            unsafe { core::hint::assert_unchecked(actual_idx < i32::MAX as u32) };
+            unsafe { core::hint::assert_unchecked(actual_idx <= i32::MAX as u32) };
             let value = unsafe { *self.get_unchecked(actual_idx as usize) };
             f32::from_bits(value.to_bits() & cond)
         }
@@ -309,11 +315,14 @@ mod _interp_impls {
 
     impl GatherUtils for [i8] {
         #[inline(always)]
-        unsafe fn get_or_zero(&self, idx: u32) -> f32 {
+        fn get_or_zero(&self, idx: u32) -> f32 {
+            if !(1..=MAX_DRUM_LEN).contains(&self.len()) {
+                return 0.0;
+            }
             let len = self.len() as u32 - 1;
             let cond = 0_u8.wrapping_sub((idx <= len) as u8);
             let actual_idx = idx.min(len);
-            unsafe { core::hint::assert_unchecked(actual_idx < i32::MAX as u32) };
+            unsafe { core::hint::assert_unchecked(actual_idx <= i32::MAX as u32) };
             let value = unsafe { *self.get_unchecked(actual_idx as usize) };
             (value & cond as i8) as f32
         }
@@ -339,12 +348,10 @@ mod _interp_impls {
         }
 
         #[inline(always)]
-        unsafe fn drum(drum: &[OrgSmp], pos: u32, frac: f32) -> f32 {
-            unsafe {
-                let sample1 = drum.get_or_zero(pos);
-                let sample2 = drum.get_or_zero(pos.wrapping_add(1));
-                (sample2 - sample1).fma(frac, sample1)
-            }
+        fn drum(drum: &[OrgSmp], pos: u32, frac: f32) -> f32 {
+            let sample1 = drum.get_or_zero(pos);
+            let sample2 = drum.get_or_zero(pos.wrapping_add(1));
+            (sample2 - sample1).fma(frac, sample1)
         }
     }
 
@@ -355,19 +362,32 @@ mod _interp_impls {
         }
 
         #[inline(always)]
-        unsafe fn drum(drum: &[OrgSmp], pos: u32, _frac: f32) -> f32 {
-            unsafe { drum.get_or_zero(pos) }
+        fn drum(drum: &[OrgSmp], pos: u32, _frac: f32) -> f32 {
+            drum.get_or_zero(pos)
         }
     }
 
+    // I put raw C++ code in clang and translated llvm ir to Rust code lol.
+    // Seems in C++ they try to employ fma by default (-ffp-contract=on).
+    // But Rust strictly follows what programmer wrote.
     #[inline(always)]
     fn lagrange(s1: f32, s2: f32, s3: f32, s4: f32, frac: f32) -> f32 {
-        let c0 = s2;
-        let c1 = s4.fma(-1.0 / 6.0, s2.fma(-1.0 / 2.0, s1.fma(-1.0 / 3.0, s3)));
-        let c2 = (s1 + s3).fma(1.0 / 2.0, -s2);
-        let c3 = (s4 - s1).fma(1.0 / 6.0, (s2 - s3) * 1.0 / 2.0);
-
-        ((c3.fma(frac, c2)).fma(frac, c1)).fma(frac, c0)
+        let neg = -s1;
+        let p0 = neg.fma(1.0 / 3.0, s3);
+        let neg1 = -s2;
+        let p1 = neg1.fma(1.0 / 2.0, p0);
+        let neg2 = -s4;
+        let p2 = neg2.fma(1.0 / 6.0, p1);
+        let add = s1 + s3;
+        let p3 = add.fma(1.0 / 2.0, neg1);
+        let sub = s4 - s1;
+        let sub4 = s2 - s3;
+        let mul5 = sub4 * (1.0 / 2.0);
+        let p4 = sub.fma(1.0 / 6.0, mul5);
+        let p5 = p4.fma(frac, p3);
+        let p6 = p5.fma(frac, p2);
+        let p7 = p6.fma(frac, s2);
+        return p7;
     }
 
     impl OrgInterpolation for Lagrange {
@@ -393,7 +413,7 @@ mod _interp_impls {
         }
 
         #[inline(always)]
-        unsafe fn drum(drum: &[OrgSmp], pos: u32, frac: f32) -> f32 {
+        fn drum(drum: &[OrgSmp], pos: u32, frac: f32) -> f32 {
             #[rustfmt::skip]
             let idx = [
                 pos.wrapping_sub(1),
@@ -401,14 +421,12 @@ mod _interp_impls {
                 pos.wrapping_add(1),
                 pos.wrapping_add(2),
             ];
-            unsafe {
-                let s1 = drum.get_or_zero(idx[0]);
-                let s2 = drum.get_or_zero(idx[1]);
-                let s3 = drum.get_or_zero(idx[2]);
-                let s4 = drum.get_or_zero(idx[3]);
+            let s1 = drum.get_or_zero(idx[0]);
+            let s2 = drum.get_or_zero(idx[1]);
+            let s3 = drum.get_or_zero(idx[2]);
+            let s4 = drum.get_or_zero(idx[3]);
 
-                lagrange(s1, s2, s3, s4, frac)
-            }
+            lagrange(s1, s2, s3, s4, frac)
         }
     }
 }
@@ -631,8 +649,10 @@ impl<const DRUM: bool> Instrument<DRUM> {
                 let sample = unsafe {
                     if DRUM {
                         let base_pos = pos.0 + (pos_sub >> 24);
-                        core::hint::assert_unchecked(base_pos < 500000 + 256 * 256 + 256);
-                        core::hint::assert_unchecked((1..=500000).contains(&cur_wave.len()));
+                        core::hint::assert_unchecked(
+                            base_pos < MAX_DRUM_LEN as u32 + 256 * 256 + 256,
+                        );
+                        core::hint::assert_unchecked((1..=MAX_DRUM_LEN).contains(&cur_wave.len()));
                         let frac = (pos_sub & I24MASK) as f32 / F24;
                         let val = I::drum(cur_wave, base_pos, frac);
                         pos_sub += inc_sub_24;
