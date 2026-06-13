@@ -692,7 +692,7 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
 
         #[cfg(feature = "simd")]
         {
-            use wide::{f32x8, u32x8};
+            use wide::{f32x8, i32x8, u32x8};
 
             // Usually remainder seems to be processed in scalar, but it was slower in my benchmark.
             let simd_path_cnt = n.div_ceil(8);
@@ -703,11 +703,14 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
                     let base_pos = u32x8::splat(pos.0) + lane * u32x8::splat(inc_i);
                     let lane: f32x8 = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0].into();
                     let sub_pos = lane.mul_add(f32x8::splat(inc_sub), f32x8::splat(pos_sub));
-                    // i32 to u32 cast
-                    let sub_pos_i: u32x8 = core::mem::transmute(sub_pos.fast_trunc_int());
-                    let sub_floor: f32x8 = sub_pos.floor();
 
-                    let base_pos = base_pos + sub_pos_i;
+                    let sub_pos_i: i32x8 = sub_pos.fast_trunc_int();
+                    let sub_pos_u: u32x8 = core::mem::transmute(sub_pos_i);
+                    // sub_pos.floor() seems to be slower here,
+                    // because floating point port is being overloaded?
+                    let sub_floor: f32x8 = sub_pos_i.round_float();
+
+                    let base_pos = base_pos + sub_pos_u;
                     let sub_frac = sub_pos - sub_floor;
 
                     let result = if DRUM {
