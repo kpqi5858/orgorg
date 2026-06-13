@@ -224,6 +224,14 @@ unsafe impl SoundbankProvider for Soundbank<'_> {
 /// Keep in mind that these functions are called at audio rate.
 /// You would like to put `#[inline]` and optimize them really well.
 pub trait OrgInterpolation {
+    /// How many samples prior to `pos` required by the interpolation.
+    ///
+    /// If the interpolation samples at `pos - N`,
+    /// this should be set to `N` to ensure potential trailing non-zero values get written.
+    ///
+    /// Only relevant for drum.
+    const INTERP_REMNANT: u32 = 0;
+
     /// Interpolate the `wave` from `(pos).(frac)`.
     ///
     /// `pos` should be wrapped by 256 (`& 0xff`) before indexing.
@@ -341,6 +349,8 @@ mod _interp_impls {
     }
 
     impl OrgInterpolation for Lagrange {
+        const INTERP_REMNANT: u32 = 1;
+
         #[inline(always)]
         fn wave_simd(wave: &[i8; 256], pos: u32x8, frac: f32x8) -> f32x8 {
             let s1 = retrieve_wave_data(wave, pos - u32x8::splat(1));
@@ -427,6 +437,8 @@ mod _interp_impls {
     }
 
     impl OrgInterpolation for Lagrange {
+        const INTERP_REMNANT: u32 = 1;
+
         #[inline(always)]
         fn wave(wave: &[i8; 256], pos: u32, frac: f32) -> f32 {
             #[rustfmt::skip]
@@ -765,7 +777,7 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
                         pos += inc_i * 8 + sub_i as u32;
                     }
 
-                    if DRUM && pos.0 >= cur_wave.len() as u32 {
+                    if DRUM && pos.0 >= cur_wave.len() as u32 + I::INTERP_REMNANT {
                         self.cur_len = 0;
                         return;
                     }
@@ -799,7 +811,7 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
                 let val = if pos_sub >= 1.0 { 1 } else { 0 };
                 pos += val as u32 + inc_i;
                 pos_sub -= val as f32;
-                if DRUM && pos.0 >= cur_wave.len() as u32 {
+                if DRUM && pos.0 >= cur_wave.len() as u32 + I::INTERP_REMNANT {
                     self.cur_len = 0;
                     return;
                 }
