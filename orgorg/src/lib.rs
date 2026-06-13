@@ -399,6 +399,19 @@ mod _interp_impls {
     use super::OrgInterpolation;
     use super::interp_impls::*;
 
+    trait BranchlessGather {
+        fn get_or_zero(&self, idx: usize) -> i8;
+    }
+
+    impl BranchlessGather for [i8] {
+        fn get_or_zero(&self, idx: usize) -> i8 {
+            let cond = idx < self.len();
+            let actual_idx = core::hint::select_unpredictable(cond, idx, 0);
+            let value = unsafe { *self.get_unchecked(actual_idx) };
+            core::hint::select_unpredictable(cond, value, 0)
+        }
+    }
+
     impl OrgInterpolation for Linear {
         #[inline(always)]
         fn wave(wave: &[i8; 256], pos: u32, frac: f32) -> f32 {
@@ -413,8 +426,8 @@ mod _interp_impls {
 
         #[inline(always)]
         fn drum(drum: &[i8], pos: u32, frac: f32) -> f32 {
-            let sample1 = drum.get(pos as usize).copied().unwrap_or(0);
-            let sample2 = drum.get(pos.wrapping_add(1) as usize).copied().unwrap_or(0);
+            let sample1 = drum.get_or_zero(pos as usize);
+            let sample2 = drum.get_or_zero(pos.wrapping_add(1) as usize);
             sample1 as f32 + ((sample2 as i32) - (sample1 as i32)) as f32 * frac
         }
     }
@@ -427,7 +440,7 @@ mod _interp_impls {
 
         #[inline(always)]
         fn drum(drum: &[i8], pos: u32, _frac: f32) -> f32 {
-            drum.get(pos as usize).copied().unwrap_or(0) as f32
+            drum.get_or_zero(pos as usize) as f32
         }
     }
 
@@ -465,10 +478,10 @@ mod _interp_impls {
                 pos.wrapping_add(1) as usize,
                 pos.wrapping_add(2) as usize,
             ];
-            let s1 = drum.get(idx[0]).copied().unwrap_or(0) as f32;
-            let s2 = drum.get(idx[1]).copied().unwrap_or(0) as f32;
-            let s3 = drum.get(idx[2]).copied().unwrap_or(0) as f32;
-            let s4 = drum.get(idx[3]).copied().unwrap_or(0) as f32;
+            let s1 = drum.get_or_zero(idx[0]) as f32;
+            let s2 = drum.get_or_zero(idx[1]) as f32;
+            let s3 = drum.get_or_zero(idx[2]) as f32;
+            let s4 = drum.get_or_zero(idx[3]) as f32;
 
             let c0 = s2;
             let c1 = s3 - s1 * (1.0 / 3.0) - s2 * (1.0 / 2.0) - s4 * (1.0 / 6.0);
@@ -890,9 +903,9 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
                 }
                 pos_sub += inc_sub;
                 // We know that pos_sub is in 0..1 range so this is faster than naive integer cast.
-                let val = if pos_sub >= 1.0 { 1 } else { 0 };
-                pos += inc_i.wrapping_add(val as u32);
-                pos_sub -= val as f32;
+                let cond = pos_sub >= 1.0;
+                pos += core::hint::select_unpredictable(cond, inc_i.wrapping_add(1), inc_i);
+                pos_sub = core::hint::select_unpredictable(cond, pos_sub - 1.0, pos_sub);
                 if DRUM && pos.0 >= cur_wave.len() as u32 + I::INTERP_REMNANT {
                     self.cur_len = 0;
                     return;
