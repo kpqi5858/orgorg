@@ -838,8 +838,9 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
                             );
                             let stereo_vol =
                                 f32x8::from([left, right, left, right, left, right, left, right]);
-                            let buf_1_ptr = buf.as_mut_ptr().add(i * 16);
-                            let buf_2_ptr = buf.as_mut_ptr().add(i * 16 + 8);
+                            let ptr = buf.as_mut_ptr();
+                            let buf_1_ptr = ptr.add(i * 16);
+                            let buf_2_ptr = ptr.add(i * 16 + 8);
                             let buf_1 = buf_1_ptr.cast::<f32x8>().read_unaligned();
                             let buf_2 = buf_2_ptr.cast::<f32x8>().read_unaligned();
                             let buf_1_res = stereo_out.0.mul_add(stereo_vol, buf_1);
