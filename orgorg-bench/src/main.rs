@@ -1,12 +1,12 @@
 use std::{hint::black_box, time::Instant};
 
-use orgorg::{CaveStoryAssetProvider, OrgPlayBuilder, interp_impls::Linear, wt};
+use orgorg::{CaveStoryAssetProvider, OrgPlayBuilder, OrgSmp, interp_impls::Linear};
 
-const fn to_wt_array<const N: usize>(arr: [u8; N]) -> [wt; N] {
+const fn to_wt_array<const N: usize>(arr: [u8; N]) -> [OrgSmp; N] {
     let mut a = [unsafe { core::mem::zeroed() }; N];
     let mut i = 0;
     while i < N {
-        a[i] = arr[i] as wt;
+        a[i] = arr[i] as OrgSmp;
         i += 1;
     }
     a
@@ -16,12 +16,12 @@ struct ConstAsset;
 
 impl CaveStoryAssetProvider for ConstAsset {
     #[inline(always)]
-    fn wavetable(&self) -> &[wt; 25600] {
+    fn wavetable(&self) -> &[OrgSmp; 25600] {
         &const { to_wt_array(*include_bytes!("../wavetable.dat")) }
     }
 
     #[inline(always)]
-    fn drum(&self) -> &[wt; 40000] {
+    fn drum(&self) -> &[OrgSmp; 40000] {
         &const { to_wt_array(*include_bytes!("../drums.dat")) }
     }
 }

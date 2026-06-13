@@ -20,7 +20,7 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
 use is_terminal::IsTerminal;
-use orgorg::{OrgPlay, OrgPlayBuilder, PlayResult, PlayTill, Soundbank, wt};
+use orgorg::{OrgPlay, OrgPlayBuilder, OrgSmp, PlayResult, PlayTill, Soundbank};
 use self_cell::self_cell;
 
 use crate::{
@@ -307,8 +307,8 @@ fn dump_and_synth(file: &Path) -> Result<AssetByDump> {
 
 fn to_soundbank(asset: AssetByDump) -> OwnedSoundbank {
     let mut data = Vec::with_capacity(25600 + 40000);
-    data.extend(asset.0.into_iter().map(|v| v as wt));
-    data.extend(asset.1.into_iter().map(|v| v as wt));
+    data.extend(asset.0.into_iter().map(|v| v as OrgSmp));
+    data.extend(asset.1.into_iter().map(|v| v as OrgSmp));
     OwnedSoundbank::new(data.into_boxed_slice(), |d| {
         let (wavetable, drums) = d.split_at(25600);
         let drums = Box::new([

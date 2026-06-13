@@ -72,11 +72,9 @@ const MASTER_VOLUME: f32 = 1.0 / (1 << 19) as f32;
 ///
 /// [`f32`] if `simd`, [`i8`] if not `simd`.
 #[cfg(feature = "simd")]
-#[allow(non_camel_case_types)]
-pub type wt = f32;
+pub type OrgSmp = f32;
 #[cfg(not(feature = "simd"))]
-#[allow(non_camel_case_types)]
-pub type wt = i8;
+pub type OrgSmp = i8;
 
 /// Provides original Cave Story wavetable and drum samples to [`OrgPlay`].
 ///
@@ -88,11 +86,11 @@ pub type wt = i8;
 /// that holds references to the data.
 pub trait CaveStoryAssetProvider {
     /// The original `wavetable.dat` file.
-    fn wavetable(&self) -> &[wt; 25600];
+    fn wavetable(&self) -> &[OrgSmp; 25600];
     /// 6 pxt samples concatenated.
     ///
     /// Order is: fx96, fx97, fx9a, fx98, fx99, fx9b
-    fn drum(&self) -> &[wt; 40000];
+    fn drum(&self) -> &[OrgSmp; 40000];
 }
 
 /// Provides wavetable and drum samples to [`OrgPlay`].
@@ -110,7 +108,7 @@ pub trait CaveStoryAssetProvider {
 /// In other words, don't tamper with outputs using interior mutability or external source.
 pub unsafe trait SoundbankProvider {
     /// The original `wavetable.dat` file, or 100 concatenated 256-length waves.
-    fn wavetable(&self) -> &[wt; 25600];
+    fn wavetable(&self) -> &[OrgSmp; 25600];
 
     /// The drum channel with `idx` wave will be silenced if this returns `false`.
     fn is_drum_valid(&self, idx: u8) -> bool;
@@ -119,13 +117,13 @@ pub unsafe trait SoundbankProvider {
     /// # Safety
     /// Caller must not call this function
     /// if [`SoundbankProvider::is_drum_valid`] with given `idx` would return `false`.
-    unsafe fn get_drum(&self, idx: u8) -> &[wt];
+    unsafe fn get_drum(&self, idx: u8) -> &[OrgSmp];
 }
 
 // Safety: All function is consistent.
 unsafe impl<T: CaveStoryAssetProvider> SoundbankProvider for T {
     #[inline(always)]
-    fn wavetable(&self) -> &[wt; 25600] {
+    fn wavetable(&self) -> &[OrgSmp; 25600] {
         CaveStoryAssetProvider::wavetable(self)
     }
 
@@ -135,7 +133,7 @@ unsafe impl<T: CaveStoryAssetProvider> SoundbankProvider for T {
     }
 
     #[inline(always)]
-    unsafe fn get_drum(&self, idx: u8) -> &[wt] {
+    unsafe fn get_drum(&self, idx: u8) -> &[OrgSmp] {
         let drums = CaveStoryAssetProvider::drum(self).as_ptr();
         unsafe {
             let range = match idx {
@@ -153,16 +151,16 @@ unsafe impl<T: CaveStoryAssetProvider> SoundbankProvider for T {
 }
 
 /// Default provider used in [`OrgPlayBuilder::with_asset`]
-pub struct AssetByRef<'a>(&'a [wt; 25600], &'a [wt; 40000]);
+pub struct AssetByRef<'a>(&'a [OrgSmp; 25600], &'a [OrgSmp; 40000]);
 
 impl CaveStoryAssetProvider for AssetByRef<'_> {
     #[inline(always)]
-    fn wavetable(&self) -> &[wt; 25600] {
+    fn wavetable(&self) -> &[OrgSmp; 25600] {
         self.0
     }
 
     #[inline(always)]
-    fn drum(&self) -> &[wt; 40000] {
+    fn drum(&self) -> &[OrgSmp; 40000] {
         self.1
     }
 }
@@ -172,8 +170,8 @@ impl CaveStoryAssetProvider for AssetByRef<'_> {
 /// 43 drums will play Org-03 songs properly.
 #[derive(Clone)]
 pub struct Soundbank<'a> {
-    wavetable: &'a [wt; 25600],
-    drums: &'a [&'a [wt]],
+    wavetable: &'a [OrgSmp; 25600],
+    drums: &'a [&'a [OrgSmp]],
 }
 
 impl<'a> Soundbank<'a> {
@@ -182,7 +180,7 @@ impl<'a> Soundbank<'a> {
     /// - More than 255 `drums` is effectively ignored.
     /// - If length of a drum is not in `[1, 500000]`,
     ///   that particular drum is considered invalid and won't play a sound.
-    pub fn new(wavetable: &'a [wt; 25600], drums: &'a [&'a [wt]]) -> Self {
+    pub fn new(wavetable: &'a [OrgSmp; 25600], drums: &'a [&'a [OrgSmp]]) -> Self {
         Self { wavetable, drums }
     }
 }
@@ -190,7 +188,7 @@ impl<'a> Soundbank<'a> {
 // Safety: All function is consistent.
 unsafe impl SoundbankProvider for Soundbank<'_> {
     #[inline(always)]
-    fn wavetable(&self) -> &[wt; 25600] {
+    fn wavetable(&self) -> &[OrgSmp; 25600] {
         self.wavetable
     }
 
@@ -201,7 +199,7 @@ unsafe impl SoundbankProvider for Soundbank<'_> {
     }
 
     #[inline(always)]
-    unsafe fn get_drum(&self, idx: u8) -> &[wt] {
+    unsafe fn get_drum(&self, idx: u8) -> &[OrgSmp] {
         unsafe { self.drums.get_unchecked(idx as usize) }
     }
 }
@@ -1243,8 +1241,8 @@ impl<I, A> OrgPlayBuilder<I, A> {
     /// See [`CaveStoryAssetProvider`] for more information.
     pub fn with_asset<'a>(
         self,
-        wavetable: &'a [wt; 25600],
-        drum: &'a [wt; 40000],
+        wavetable: &'a [OrgSmp; 25600],
+        drum: &'a [OrgSmp; 40000],
     ) -> OrgPlayBuilder<I, AssetByRef<'a>> {
         self.with_soundbank_provider(AssetByRef(wavetable, drum))
     }
