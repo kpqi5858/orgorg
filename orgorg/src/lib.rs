@@ -942,9 +942,8 @@ impl PlayResult {
 /// `no_std` compatible Cave Story Organya Music Player.
 pub struct OrgPlay<'a, I: OrgInterpolation, A: SoundbankProvider> {
     sample_rate: u32,
-    // I want to make this integer, but then RATE must be multiple of 1000.
-    samples_per_beat: f32,
-    remaining_samples: f32,
+    samples_per_beat: i32,
+    remaining_samples: i32,
     loop_start: u32,
     loop_end: u32,
     cur_beat: u32,
@@ -994,7 +993,11 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
         if ms_per_beat == 0 {
             return None;
         }
-        let samples_per_beat = ms_per_beat as f32 * (rate as f32 / 1000.0);
+        let samples_per_beat: i32 = rate.checked_mul(ms_per_beat as u32)?.try_into().ok()?;
+        // To prevent overflow in synth method
+        if samples_per_beat > i32::MAX / 1000 * 1000 {
+            return None;
+        }
         let loop_start = song_reader.read_u32(10);
         let loop_end = song_reader.read_u32(14);
         if loop_end < loop_start {
@@ -1163,7 +1166,7 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
         buf.fill(0.0);
         let mut filled_raw = 0;
         while filled_raw < buf.len() {
-            if self.remaining_samples <= 0.0 {
+            if self.remaining_samples <= 0 {
                 self.remaining_samples += self.samples_per_beat;
                 self.cur_beat += 1;
                 let looped;
@@ -1199,7 +1202,7 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
                     }
                 }
             }
-            debug_assert!(self.remaining_samples > 0.0);
+            debug_assert!(self.remaining_samples > 0);
             let from_raw = filled_raw;
             // Seems compiler can't treat channel as const and optimize here.
             // let channel = if MONO { 1 } else { 2 };
@@ -1210,16 +1213,13 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
             // );
             // So, manual branching here.
             let to_fill_raw = if MONO {
-                // TODO: Drop libm dependency when core_float_math lands,
-                // since this is the only place libm is used,
-                // and this will block generating native ceil instruction.
                 cmp::min(
-                    libm::ceilf(self.remaining_samples) as usize,
+                    (self.remaining_samples as u32).div_ceil(1000) as usize,
                     buf.len() - filled_raw,
                 )
             } else {
                 cmp::min(
-                    libm::ceilf(self.remaining_samples) as usize * 2,
+                    (self.remaining_samples as u32).div_ceil(1000) as usize * 2,
                     buf.len() - filled_raw,
                 )
             };
@@ -1234,9 +1234,9 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
             filled_raw += to_fill_raw;
             // Same thing probably applies here
             if MONO {
-                self.remaining_samples -= (to_fill_raw) as f32;
+                self.remaining_samples -= to_fill_raw as i32 * 1000;
             } else {
-                self.remaining_samples -= (to_fill_raw / 2) as f32;
+                self.remaining_samples -= to_fill_raw as i32 * 500;
             }
         }
         PlayResult(false, buf.len())
