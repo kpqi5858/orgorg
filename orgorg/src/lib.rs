@@ -4,6 +4,8 @@
 //!
 //! Partially based on bisqwit's C++ OrgPlay.
 //!
+//! Designed to be 100% pure, side-effect free.
+//!
 //! # Example
 //! ```no_run
 //! // Basic example for playing Org-02 music with original Cave Story drum sound effects.
@@ -835,7 +837,7 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
                 pos_sub += inc_sub;
                 // We know that pos_sub is in 0..1 range so this is faster than naive integer cast.
                 let val = if pos_sub >= 1.0 { 1 } else { 0 };
-                pos += val as u32 + inc_i;
+                pos += inc_i.wrapping_add(val as u32);
                 pos_sub -= val as f32;
                 if DRUM && pos.0 >= cur_wave.len() as u32 + I::INTERP_REMNANT {
                     self.cur_len = 0;
