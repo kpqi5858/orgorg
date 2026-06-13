@@ -46,7 +46,7 @@
 //! Uses Fused Multiply Add where possible, which might improve performance if the platform supports it.
 //!
 //! - `fma` requires `std`.
-//! - `fma-nightly` does not require `std` but requires nightly compiler, and it can be non-deterministic.
+//! - `fma-nightly` does not require `std` but requires nightly compiler.
 //!
 //! # Cargo Features: `f32smp`
 //!
