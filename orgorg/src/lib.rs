@@ -618,7 +618,7 @@ impl<const DRUM: bool> Instrument<DRUM> {
             buf.get_unchecked_mut(0..n_len)
         };
 
-        let inc_i = self.cur_len_or_phase_acc >> 24;
+        let inc_i = self.phase_inc >> 24;
         let wave_inc = self.phase_inc;
         let inc_sub_24 = self.phase_inc & I24MASK;
 
