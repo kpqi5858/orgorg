@@ -715,9 +715,9 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
                         let sub_frac = sub_frac_i.round_float() / f32x8::splat(F24);
 
                         if i == simd_path_cnt - 1 && simd_path_rem != 0 {
-                            pos += wave_inc * simd_path_rem as u32;
+                            pos += wave_inc.wrapping_mul(simd_path_rem as u32);
                         } else {
-                            pos += wave_inc * 8;
+                            pos += wave_inc.wrapping_mul(8);
                         }
                         I::wave_simd(cur_wave.try_into().unwrap_unchecked(), base_pos, sub_frac)
                     } else {
