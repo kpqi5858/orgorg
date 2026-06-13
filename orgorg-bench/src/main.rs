@@ -34,19 +34,15 @@ fn main() {
         .with_soundbank_provider(ConstAsset)
         .build(black_box(song))
         .unwrap();
-    let mut cur = Instant::now();
+    let cur = Instant::now();
     let mut loops = 0;
     let mut buf = vec![0.0; 4096];
-    loop {
+    let goal: usize = 1024 * 1024 * 1024;
+    while loops < goal {
         orgplay.synth_stereo(&mut buf);
         black_box(&buf);
-        loops += 1;
-        let elapsed = cur.elapsed().as_secs_f64();
-        if elapsed >= 1.0 {
-            let bytes = loops * buf.len() * 4;
-            println!("{} MB/s", bytes / 1024 / 1024);
-            loops = 0;
-            cur = Instant::now();
-        }
+        loops += buf.len();
     }
+    let elapsed = cur.elapsed().as_secs_f64();
+    println!("{:.2}", elapsed);
 }
