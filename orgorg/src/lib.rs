@@ -239,9 +239,10 @@ pub trait OrgInterpolation {
 
     /// Interpolate the `wave` from `(pos).(frac)`, in 8-lane.
     ///
-    /// `pos` is guaranteed to be less than 256.
+    /// # Safety
+    /// `pos` must be less than 256.
     #[cfg(feature = "simd")]
-    fn wave_simd(wave: &[f32; 256], pos: wide::u32x8, frac: wide::f32x8) -> wide::f32x8;
+    unsafe fn wave_simd(wave: &[f32; 256], pos: wide::u32x8, frac: wide::f32x8) -> wide::f32x8;
 
     /// Interpolate the `drum` from `(pos).(frac)`, in 8-lane.
     ///
@@ -324,7 +325,7 @@ mod _interp_impls {
 
     impl OrgInterpolation for Linear {
         #[inline(always)]
-        fn wave_simd(wave: &[f32; 256], pos: u32x8, frac: f32x8) -> f32x8 {
+        unsafe fn wave_simd(wave: &[f32; 256], pos: u32x8, frac: f32x8) -> f32x8 {
             let wave_data1 = unsafe { gather(wave, pos) };
             let wave_data2 = retrieve_wave_data(wave, pos + u32x8::splat(1));
             // Linear Interpolation
@@ -344,7 +345,7 @@ mod _interp_impls {
 
     impl OrgInterpolation for NoInterp {
         #[inline(always)]
-        fn wave_simd(wave: &[f32; 256], pos: u32x8, _frac: f32x8) -> f32x8 {
+        unsafe fn wave_simd(wave: &[f32; 256], pos: u32x8, _frac: f32x8) -> f32x8 {
             unsafe { gather(wave, pos) }
         }
 
@@ -358,7 +359,7 @@ mod _interp_impls {
         const INTERP_REMNANT: u32 = 1;
 
         #[inline(always)]
-        fn wave_simd(wave: &[f32; 256], pos: u32x8, frac: f32x8) -> f32x8 {
+        unsafe fn wave_simd(wave: &[f32; 256], pos: u32x8, frac: f32x8) -> f32x8 {
             let s1 = retrieve_wave_data(wave, pos - u32x8::splat(1));
             let s2 = unsafe { gather(wave, pos) };
             let s3 = retrieve_wave_data(wave, pos + u32x8::splat(1));
