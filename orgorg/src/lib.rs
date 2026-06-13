@@ -967,40 +967,48 @@ pub struct OrgPlay<'a, I: OrgInterpolation, A: SoundbankProvider> {
 
 impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
     fn new(asset: A, song: &'a [u8], rate: u32) -> Option<Self> {
-        trait U8SliceExt {
-            fn read_i16(&self, offset: usize) -> i16;
-            fn read_u16(&self, offset: usize) -> u16;
-            fn read_u32(&self, offset: usize) -> u32;
-        }
+        struct UnsafeReader<'a>(&'a [u8]);
+        impl<'a> UnsafeReader<'a> {
+            unsafe fn new(a: &'a [u8]) -> Self {
+                Self(a)
+            }
 
-        impl U8SliceExt for [u8] {
-            #[inline]
+            fn read<const N: usize>(&self, offset: usize) -> [u8; N] {
+                unsafe { self.0.get_unchecked(offset..offset + N).try_into().unwrap() }
+            }
+
+            fn read_u8(&self, offset: usize) -> u8 {
+                self.read::<1>(offset)[0]
+            }
+
             fn read_i16(&self, offset: usize) -> i16 {
-                i16::from_le_bytes(self[offset..offset + 2].try_into().unwrap())
+                i16::from_le_bytes(self.read(offset))
             }
-            #[inline]
+
             fn read_u16(&self, offset: usize) -> u16 {
-                u16::from_le_bytes(self[offset..offset + 2].try_into().unwrap())
+                u16::from_le_bytes(self.read(offset))
             }
-            #[inline]
+
             fn read_u32(&self, offset: usize) -> u32 {
-                u32::from_le_bytes(self[offset..offset + 4].try_into().unwrap())
+                u32::from_le_bytes(self.read(offset))
             }
         }
 
         if song.len() < 114 {
             return None;
         }
+        // Safety: all following read is index <= 114
+        let song_reader = unsafe { UnsafeReader::new(song) };
         if !matches!(&song[0..6], b"Org-02" | b"Org-03") {
             return None;
         }
-        let ms_per_beat = song.read_u16(6);
+        let ms_per_beat = song_reader.read_u16(6);
         if ms_per_beat == 0 {
             return None;
         }
         let samples_per_beat = ms_per_beat as f32 * (rate as f32 / 1000.0);
-        let loop_start = song.read_u32(10);
-        let loop_end = song.read_u32(14);
+        let loop_start = song_reader.read_u32(10);
+        let loop_end = song_reader.read_u32(14);
         if loop_end < loop_start {
             return None;
         }
@@ -1015,11 +1023,10 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
         let mut drum_ins = [const { MaybeUninit::uninit() }; 8];
 
         for val in &mut wave_ins {
-            let wave = song[offset + 2];
+            let wave = song_reader.read_u8(offset + 2);
             let valid_wave = (0..100).contains(&wave);
-
-            let n_events = song.read_u16(offset + 4);
-            let pi = song[offset + 3] != 0;
+            let n_events = song_reader.read_u16(offset + 4);
+            let pi = song_reader.read_u8(offset + 3) != 0;
             let inst_data_ptr = if n_events == 0 {
                 NonNull::dangling()
             } else {
@@ -1030,7 +1037,7 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
             };
             let mut ret = Instrument {
                 inst_data_ptr,
-                tuning: song.read_i16(offset),
+                tuning: song_reader.read_i16(offset),
                 pi,
                 n_events: if valid_wave { n_events } else { 0 }, // Must be 0 for invalid wave
                 phase_inc: AccTy::default(),
@@ -1052,10 +1059,10 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
             val.write(ret);
         }
         for val in &mut drum_ins {
-            let wave = song[offset + 2];
+            let wave = song_reader.read_u8(offset + 2);
             let valid_wave = asset.is_drum_valid(wave);
-            let n_events = song.read_u16(offset + 4);
-            let pi = song[offset + 3] != 0;
+            let n_events = song_reader.read_u16(offset + 4);
+            let pi = song_reader.read_u8(offset + 3) != 0;
             let inst_data_ptr = if n_events == 0 {
                 NonNull::dangling()
             } else {
@@ -1066,7 +1073,7 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
             };
             let mut ret = Instrument {
                 inst_data_ptr,
-                tuning: song.read_i16(offset),
+                tuning: song_reader.read_i16(offset),
                 pi,
                 n_events: if valid_wave { n_events } else { 0 }, // Must be 0 for invalid wave
                 phase_inc: AccTy::default(),
