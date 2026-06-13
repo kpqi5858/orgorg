@@ -6,7 +6,7 @@ license = "MIT"
 publish = false
 
 [dependencies]
-orgorg = { path = "../orgorg", features = ["simd"] }
+orgorg = { path = "../orgorg", features = ["std"] }
 criterion = "0.8.1"
 
 [[bench]]

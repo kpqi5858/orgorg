@@ -9,7 +9,7 @@ keywords = ["no_std", "audio", "music"]
 repository = "https://github.com/kpqi5858/orgorg"
 
 [features]
-simd = ["dep:wide"]
+std = []
 
 [dependencies]
 wide = { version = "1.1.1", optional = true }

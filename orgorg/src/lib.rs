@@ -1,4 +1,4 @@
-#![no_std]
+#![cfg_attr(not(feature = "std"), no_std)]
 
 //! `no_std` compatible Cave Story Organya Music Player.
 //!
@@ -73,10 +73,7 @@ const MASTER_VOLUME: f32 = 1.0 / (1 << 19) as f32;
 /// Type of drums and wavetable data.
 ///
 /// [`f32`] if `simd`, [`i8`] if not `simd`.
-#[cfg(feature = "simd")]
 pub type OrgSmp = f32;
-#[cfg(not(feature = "simd"))]
-pub type OrgSmp = i8;
 
 /// Provides original Cave Story wavetable and drum samples to [`OrgPlay`].
 ///
@@ -225,8 +222,7 @@ pub trait OrgInterpolation {
     /// Interpolate the `wave` from `(pos).(frac)`.
     ///
     /// `pos` should be wrapped by 256 (`& 0xff`) before indexing.
-    #[cfg(not(feature = "simd"))]
-    fn wave(wave: &[i8; 256], pos: u32, frac: f32) -> f32;
+    fn wave(wave: &[f32; 256], pos: u32, frac: f32) -> f32;
 
     /// Interpolate the `drum` from `(pos).(frac)`.
     ///
@@ -234,27 +230,7 @@ pub trait OrgInterpolation {
     ///
     /// If `drum.len()` is too big (Exact value is not specified, but not greater than
     /// [`SoundbankProvider::get_drum`] requirement), it can produce incorrect result.
-    #[cfg(not(feature = "simd"))]
-    fn drum(drum: &[i8], pos: u32, frac: f32) -> f32;
-
-    /// Interpolate the `wave` from `(pos).(frac)`, in 8-lane.
-    ///
-    /// # Safety
-    /// `pos` must be less than 256.
-    #[cfg(feature = "simd")]
-    unsafe fn wave_simd(wave: &[f32; 256], pos: wide::u32x8, frac: wide::f32x8) -> wide::f32x8;
-
-    /// Interpolate the `drum` from `(pos).(frac)`, in 8-lane.
-    ///
-    /// Out of bounds `drum` read should be 0.
-    ///
-    /// If `drum.len()` is too big (Exact value is not specified, but not greater than
-    /// [`SoundbankProvider::get_drum`] requirement), it can produce incorrect result.
-    ///
-    /// # Safety
-    /// `drum` must not be empty slice.
-    #[cfg(feature = "simd")]
-    unsafe fn drum_simd(drum: &[f32], pos: wide::u32x8, frac: wide::f32x8) -> wide::f32x8;
+    fn drum(drum: &[f32], pos: u32, frac: f32) -> f32;
 }
 
 /// Builtin [`OrgInterpolation`] implementations.
@@ -269,178 +245,53 @@ pub mod interp_impls {
     pub struct Lagrange;
 }
 
-#[cfg(feature = "simd")]
-mod _interp_impls {
-    use wide::{CmpLe, f32x8, u32x8};
-
-    use super::OrgInterpolation;
-    use super::interp_impls::*;
-
-    // Helper functions
-
-    /// Safety: each pos must be in bounds
-    #[inline(always)]
-    unsafe fn gather(wave: &[f32], pos: u32x8) -> f32x8 {
-        unsafe {
-            let pos = pos.to_array();
-            f32x8::from(core::array::from_fn(|i| {
-                *wave.get_unchecked(pos[i] as usize)
-            }))
-        }
-    }
-
-    #[inline(always)]
-    fn retrieve_wave_data(cur_wave: &[f32; 256], base_pos: u32x8) -> f32x8 {
-        unsafe {
-            let base_pos = base_pos & u32x8::splat(0xff);
-            gather(cur_wave, base_pos)
-        }
-    }
-
-    /// Safety: cur_wave must not be empty
-    #[inline(always)]
-    unsafe fn retrieve_drum_data(cur_wave: &[f32], base_pos: u32x8) -> f32x8 {
-        unsafe {
-            let cmp = u32x8::splat(cur_wave.len() as u32 - 1);
-            // Casting mask
-            let in_bounds: f32x8 = core::mem::transmute(base_pos.simd_le(cmp));
-            let base_pos = base_pos.min(cmp);
-            // Masked gather exists in avx2, but it was slightly slower in my benchmark.
-            let vals = gather(cur_wave, base_pos);
-            in_bounds & vals
-        }
-    }
-
-    impl OrgInterpolation for Linear {
-        #[inline(always)]
-        unsafe fn wave_simd(wave: &[f32; 256], pos: u32x8, frac: f32x8) -> f32x8 {
-            let wave_data1 = unsafe { gather(wave, pos) };
-            let wave_data2 = retrieve_wave_data(wave, pos + u32x8::splat(1));
-            // Linear Interpolation
-            (wave_data2 - wave_data1).mul_add(frac, wave_data1)
-        }
-
-        #[inline(always)]
-        unsafe fn drum_simd(drum: &[f32], pos: u32x8, frac: f32x8) -> f32x8 {
-            unsafe {
-                let wave_data1 = retrieve_drum_data(drum, pos);
-                let wave_data2 = retrieve_drum_data(drum, pos + u32x8::splat(1));
-                // Linear Interpolation
-                (wave_data2 - wave_data1).mul_add(frac, wave_data1)
-            }
-        }
-    }
-
-    impl OrgInterpolation for NoInterp {
-        #[inline(always)]
-        unsafe fn wave_simd(wave: &[f32; 256], pos: u32x8, _frac: f32x8) -> f32x8 {
-            unsafe { gather(wave, pos) }
-        }
-
-        #[inline(always)]
-        unsafe fn drum_simd(drum: &[f32], pos: u32x8, _frac: f32x8) -> f32x8 {
-            unsafe { retrieve_drum_data(drum, pos) }
-        }
-    }
-
-    impl OrgInterpolation for Lagrange {
-        const INTERP_REMNANT: u32 = 1;
-
-        #[inline(always)]
-        unsafe fn wave_simd(wave: &[f32; 256], pos: u32x8, frac: f32x8) -> f32x8 {
-            let s1 = retrieve_wave_data(wave, pos - u32x8::splat(1));
-            let s2 = unsafe { gather(wave, pos) };
-            let s3 = retrieve_wave_data(wave, pos + u32x8::splat(1));
-            let s4 = retrieve_wave_data(wave, pos + u32x8::splat(2));
-
-            let c0 = s2;
-            let c1 = s4.mul_add(
-                f32x8::splat(-1.0 / 6.0),
-                s2.mul_add(
-                    f32x8::splat(-1.0 / 2.0),
-                    s1.mul_add(f32x8::splat(-1.0 / 3.0), s3),
-                ),
-            );
-            let c2 = (s1 + s3).mul_sub(f32x8::splat(1.0 / 2.0), s2);
-            let c3 =
-                (s4 - s1).mul_add(f32x8::splat(1.0 / 6.0), (s2 - s3) * f32x8::splat(1.0 / 2.0));
-
-            ((c3.mul_add(frac, c2)).mul_add(frac, c1)).mul_add(frac, c0)
-        }
-
-        #[inline(always)]
-        unsafe fn drum_simd(drum: &[f32], pos: u32x8, frac: f32x8) -> f32x8 {
-            unsafe {
-                let s1 = retrieve_drum_data(drum, pos - u32x8::splat(1));
-                let s2 = retrieve_drum_data(drum, pos);
-                let s3 = retrieve_drum_data(drum, pos + u32x8::splat(1));
-                let s4 = retrieve_drum_data(drum, pos + u32x8::splat(2));
-
-                let c0 = s2;
-                let c1 = s4.mul_add(
-                    f32x8::splat(-1.0 / 6.0),
-                    s2.mul_add(
-                        f32x8::splat(-1.0 / 2.0),
-                        s1.mul_add(f32x8::splat(-1.0 / 3.0), s3),
-                    ),
-                );
-                let c2 = (s1 + s3).mul_sub(f32x8::splat(1.0 / 2.0), s2);
-                let c3 =
-                    (s4 - s1).mul_add(f32x8::splat(1.0 / 6.0), (s2 - s3) * f32x8::splat(1.0 / 2.0));
-
-                ((c3.mul_add(frac, c2)).mul_add(frac, c1)).mul_add(frac, c0)
-            }
-        }
-    }
-}
-
-#[cfg(not(feature = "simd"))]
 mod _interp_impls {
     use super::OrgInterpolation;
     use super::interp_impls::*;
 
     trait BranchlessGather {
-        fn get_or_zero(&self, idx: usize) -> i8;
+        fn get_or_zero(&self, idx: u32) -> f32;
     }
 
-    impl BranchlessGather for [i8] {
-        fn get_or_zero(&self, idx: usize) -> i8 {
-            let cond = idx < self.len();
-            let actual_idx = core::hint::select_unpredictable(cond, idx, 0);
-            let value = unsafe { *self.get_unchecked(actual_idx) };
-            core::hint::select_unpredictable(cond, value, 0)
+    impl BranchlessGather for [f32] {
+        fn get_or_zero(&self, idx: u32) -> f32 {
+            let len = self.len() as u32 - 1;
+            let cond = 0_u32.wrapping_sub((idx <= len) as u32);
+            let actual_idx = idx.min(len);
+            let value = unsafe { *self.get_unchecked(actual_idx as usize) };
+            f32::from_bits(value.to_bits() & cond)
         }
     }
 
     impl OrgInterpolation for Linear {
         #[inline(always)]
-        fn wave(wave: &[i8; 256], pos: u32, frac: f32) -> f32 {
+        fn wave(wave: &[f32; 256], pos: u32, frac: f32) -> f32 {
             let idx1 = pos & 0xff;
             let sample1 = wave[idx1 as usize];
             let idx2 = pos.wrapping_add(1) & 0xff;
             let sample2 = wave[idx2 as usize];
             // The "imprecise" lerp (see Wikipedia Linear Interpolation).
             // Monotonic, and slightly fast over "precise" one.
-            sample1 as f32 + ((sample2 as i32) - (sample1 as i32)) as f32 * frac
+            (sample2 - sample1).mul_add(frac, sample1)
         }
 
         #[inline(always)]
-        fn drum(drum: &[i8], pos: u32, frac: f32) -> f32 {
-            let sample1 = drum.get_or_zero(pos as usize);
-            let sample2 = drum.get_or_zero(pos.wrapping_add(1) as usize);
-            sample1 as f32 + ((sample2 as i32) - (sample1 as i32)) as f32 * frac
+        fn drum(drum: &[f32], pos: u32, frac: f32) -> f32 {
+            let sample1 = drum.get_or_zero(pos);
+            let sample2 = drum.get_or_zero(pos.wrapping_add(1));
+            (sample2 - sample1).mul_add(frac, sample1)
         }
     }
 
     impl OrgInterpolation for NoInterp {
         #[inline(always)]
-        fn wave(wave: &[i8; 256], pos: u32, _frac: f32) -> f32 {
-            wave[(pos & 0xff) as usize] as f32
+        fn wave(wave: &[f32; 256], pos: u32, _frac: f32) -> f32 {
+            wave[(pos & 0xff) as usize]
         }
 
         #[inline(always)]
-        fn drum(drum: &[i8], pos: u32, _frac: f32) -> f32 {
-            drum.get_or_zero(pos as usize) as f32
+        fn drum(drum: &[f32], pos: u32, _frac: f32) -> f32 {
+            drum.get_or_zero(pos)
         }
     }
 
@@ -448,7 +299,7 @@ mod _interp_impls {
         const INTERP_REMNANT: u32 = 1;
 
         #[inline(always)]
-        fn wave(wave: &[i8; 256], pos: u32, frac: f32) -> f32 {
+        fn wave(wave: &[f32; 256], pos: u32, frac: f32) -> f32 {
             #[rustfmt::skip]
             let idx = [
                 pos.wrapping_sub(1) as usize & 0xff,
@@ -456,10 +307,10 @@ mod _interp_impls {
                 pos.wrapping_add(1) as usize & 0xff,
                 pos.wrapping_add(2) as usize & 0xff,
             ];
-            let s1 = wave[idx[0]] as f32;
-            let s2 = wave[idx[1]] as f32;
-            let s3 = wave[idx[2]] as f32;
-            let s4 = wave[idx[3]] as f32;
+            let s1 = wave[idx[0]];
+            let s2 = wave[idx[1]];
+            let s3 = wave[idx[2]];
+            let s4 = wave[idx[3]];
 
             let c0 = s2;
             let c1 = s3 - s1 * (1.0 / 3.0) - s2 * (1.0 / 2.0) - s4 * (1.0 / 6.0);
@@ -470,18 +321,18 @@ mod _interp_impls {
         }
 
         #[inline(always)]
-        fn drum(drum: &[i8], pos: u32, frac: f32) -> f32 {
+        fn drum(drum: &[f32], pos: u32, frac: f32) -> f32 {
             #[rustfmt::skip]
             let idx = [
-                pos.wrapping_sub(1) as usize,
-                pos                 as usize,
-                pos.wrapping_add(1) as usize,
-                pos.wrapping_add(2) as usize,
+                pos.wrapping_sub(1),
+                pos               ,
+                pos.wrapping_add(1),
+                pos.wrapping_add(2),
             ];
-            let s1 = drum.get_or_zero(idx[0]) as f32;
-            let s2 = drum.get_or_zero(idx[1]) as f32;
-            let s3 = drum.get_or_zero(idx[2]) as f32;
-            let s4 = drum.get_or_zero(idx[3]) as f32;
+            let s1 = drum.get_or_zero(idx[0]);
+            let s2 = drum.get_or_zero(idx[1]);
+            let s3 = drum.get_or_zero(idx[2]);
+            let s4 = drum.get_or_zero(idx[3]);
 
             let c0 = s2;
             let c1 = s3 - s1 * (1.0 / 3.0) - s2 * (1.0 / 2.0) - s4 * (1.0 / 6.0);
@@ -500,11 +351,6 @@ struct Event {
     panning: u8,
 }
 
-#[cfg(feature = "simd")]
-type AccTy = u32;
-#[cfg(not(feature = "simd"))]
-type AccTy = f32;
-
 struct Instrument<'a, I: OrgInterpolation, const DRUM: bool> {
     // Invariants:
     // - If n_events is 0, this pointer can be dangling so never access it
@@ -520,10 +366,10 @@ struct Instrument<'a, I: OrgInterpolation, const DRUM: bool> {
     cur_event: u16,
     // TODO: Pre-calculate this value, not on the fly
     loop_event: Option<u16>,
-    phase_inc: AccTy,
+    phase_inc: u32,
     // In `simd` and non-DRUM, this is 8.24 phase accumulator. phase_acc_sub is not used.
     phase_acc: u32,
-    phase_acc_sub: AccTy,
+    phase_acc_sub: u32,
     cur_pan: u8,
     cur_vol: u8,
     // Invariants:
@@ -538,18 +384,10 @@ struct Instrument<'a, I: OrgInterpolation, const DRUM: bool> {
 unsafe impl<'a, I: OrgInterpolation, const DRUM: bool> Send for Instrument<'a, I, DRUM> {}
 unsafe impl<'a, I: OrgInterpolation, const DRUM: bool> Sync for Instrument<'a, I, DRUM> {}
 
-#[cfg(feature = "simd")]
-mod _simd {
-    // 8.24 fixed point arithmetic
-    pub const I24: u32 = 0x1000000;
-    pub const I24MASK: u32 = I24 - 1;
-    pub const F24: f32 = I24 as f32;
-
-    #[cold]
-    pub fn cold_path() {}
-}
-#[cfg(feature = "simd")]
-use _simd::{F24, I24MASK, cold_path};
+// 8.24 fixed point arithmetic
+pub const I24: u32 = 0x1000000;
+pub const I24MASK: u32 = I24 - 1;
+pub const F24: f32 = I24 as f32;
 
 impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
     // Safety: cur_event < n_events
@@ -638,7 +476,7 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
         }
         if event.note != 255 {
             self.phase_acc = 0;
-            self.phase_acc_sub = AccTy::default();
+            self.phase_acc_sub = 0;
             self.cur_len = 0;
             let rate = rate as f32;
             if DRUM {
@@ -649,18 +487,11 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
                 // And if this condition is false, then the pitch isn't in RATE at all.
                 let in_pitch = phase_inc.is_finite() && (0.0..wave_len as f32).contains(&phase_inc);
                 if in_pitch {
-                    #[cfg(feature = "simd")]
                     unsafe {
                         let i = phase_inc.to_int_unchecked::<i32>();
                         let i_sub = phase_inc - i as f32;
                         self.cur_len = i as u32;
                         self.phase_inc = (i_sub * F24).to_int_unchecked::<i32>() as u32;
-                    }
-                    #[cfg(not(feature = "simd"))]
-                    {
-                        self.phase_inc = phase_inc;
-                        // Length logic will be handled in fill_buf
-                        self.cur_len = 1;
                     }
                 }
             } else {
@@ -674,17 +505,12 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
                 // And if this condition is false, then the pitch isn't in RATE at all.
                 let in_pitch = phase_inc.is_finite() && (0.0..256.0).contains(&phase_inc);
                 if in_pitch {
-                    #[cfg(feature = "simd")]
                     unsafe {
                         let i = phase_inc.to_int_unchecked::<i32>();
                         let i_sub = phase_inc - i as f32;
                         let v = (i << 24) | (i_sub * F24).to_int_unchecked::<i32>();
                         self.phase_inc = v as u32;
                     };
-                    #[cfg(not(feature = "simd"))]
-                    {
-                        self.phase_inc = phase_inc;
-                    }
                     self.cur_len = if self.pi {
                         // TODO: I don't know what is the accurate formula for "pi" instrument
                         // But I think this is incorrect
@@ -699,16 +525,10 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
 
     // This function is the critical part of overall performance.
     fn fill_buf<A: SoundbankProvider, const MONO: bool>(&mut self, buf: &mut [f32], a: &A) {
-        #[cfg(feature = "simd")]
         if !DRUM && self.cur_len == 0 {
             return;
         }
-        #[cfg(feature = "simd")]
         if DRUM && self.cur_len | self.phase_inc == 0 {
-            return;
-        }
-        #[cfg(not(feature = "simd"))]
-        if self.cur_len == 0 {
             return;
         }
         // Safety: See wave_idx field comment
@@ -729,194 +549,70 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
         let right = ((self.cur_pan & 0b00001111) as i32 * vol) as f32 * MASTER_VOLUME;
         let mono = (((self.cur_pan >> 4) + (self.cur_pan & 0b00001111)) as i32 * vol) as f32
             * (MASTER_VOLUME / 2.0);
-        let n = match (DRUM, MONO, self.pi) {
-            (true, true, _) | (false, true, false) => buf.len(),
-            (true, false, _) | (false, false, false) => buf.len() / 2,
-            (false, true, true) => cmp::min(buf.len(), self.cur_len as usize),
-            (false, false, true) => cmp::min(buf.len() / 2, self.cur_len as usize),
+
+        let n = match (MONO, self.pi) {
+            (true, false) => buf.len(),
+            (false, false) => buf.len() / 2,
+            (true, true) => cmp::min(buf.len(), self.cur_len as usize),
+            (false, true) => cmp::min(buf.len() / 2, self.cur_len as usize),
         };
-        #[cfg(feature = "simd")]
-        {
-            use wide::{f32x8, i32x8, u32x8};
+        let buf = unsafe {
+            let n_len = if MONO { n } else { n * 2 };
+            buf.get_unchecked_mut(0..n_len)
+        };
 
-            let mut pos = Wrapping(self.phase_acc);
-            let mut pos_sub = self.phase_acc_sub;
+        let inc_i = self.cur_len;
+        let wave_inc = self.phase_inc;
+        let inc_sub_24 = self.phase_inc;
 
-            // Usually remainder seems to be processed in scalar, but it was slower in my benchmark.
-            let simd_path_cnt = n.div_ceil(8);
-            let simd_path_rem = n % 8;
+        let mut pos = Wrapping(self.phase_acc);
+        let mut pos_sub = self.phase_acc_sub;
 
-            unsafe {
-                let inc_i = self.cur_len;
-                let wave_inc = self.phase_inc;
-                let inc_sub_24 = self.phase_inc;
-
-                for i in 0..simd_path_cnt {
-                    let result = if !DRUM {
-                        let lane: u32x8 = [0, 1, 2, 3, 4, 5, 6, 7].into();
-                        let base_pos_fp = lane * u32x8::splat(wave_inc) + u32x8::splat(pos.0);
-                        let base_pos = base_pos_fp >> 24;
-                        let sub_frac_i: i32x8 =
-                            core::mem::transmute(base_pos_fp & u32x8::splat(I24MASK));
-                        let sub_frac = sub_frac_i.round_float() / f32x8::splat(F24);
-
-                        if i == simd_path_cnt - 1 && simd_path_rem != 0 {
-                            pos += wave_inc.wrapping_mul(simd_path_rem as u32);
-                        } else {
-                            pos += wave_inc.wrapping_mul(8);
-                        }
-                        I::wave_simd(cur_wave.try_into().unwrap_unchecked(), base_pos, sub_frac)
-                    } else {
-                        let lane: u32x8 = [0, 1, 2, 3, 4, 5, 6, 7].into();
-                        let base_pos = u32x8::splat(pos.0) + lane * u32x8::splat(inc_i);
-                        // Using fixed point here as well is slightly faster.
-                        let sub_pos = lane * u32x8::splat(inc_sub_24) + u32x8::splat(pos_sub);
-                        let sub_pos_i = sub_pos >> 24;
-                        let sub_pos_f: i32x8 =
-                            core::mem::transmute(sub_pos & u32x8::splat(I24MASK));
-
-                        let base_pos: u32x8 = base_pos + sub_pos_i;
-                        let sub_frac = sub_pos_f.round_float() / f32x8::splat(F24);
-
-                        if i == simd_path_cnt - 1 && simd_path_rem != 0 {
-                            cold_path();
-                            pos_sub = sub_pos_f.to_array()[simd_path_rem] as u32;
-                            pos = Wrapping(base_pos.to_array()[simd_path_rem]);
-                        } else {
-                            pos_sub += inc_sub_24 * 8;
-                            pos += (pos_sub >> 24) + inc_i * 8;
-                            pos_sub &= I24MASK;
-                        }
-
-                        I::drum_simd(cur_wave, base_pos, sub_frac)
-                    };
-
-                    if i == simd_path_cnt - 1 && simd_path_rem != 0 {
-                        cold_path();
-                        // We calculated excess. Writing them all will cause oob write.
-                        for (idx, sample) in result
-                            .to_array()
-                            .into_iter()
-                            .take(simd_path_rem)
-                            .enumerate()
-                        {
-                            // TODO: Would like to use fma here. Wait for float_algebraic.
-                            if MONO {
-                                *buf.get_unchecked_mut(i * 8 + idx) += sample * mono;
-                            } else {
-                                *buf.get_unchecked_mut(i * 16 + idx * 2) += sample * left;
-                                *buf.get_unchecked_mut(i * 16 + idx * 2 + 1) += sample * right;
-                            }
-                        }
-                    } else {
-                        // Compiler is able to autovectorize below code nicely,
-                        // but obviously does not emit fma.
-                        // for (idx, sample) in result.to_array().into_iter().enumerate() {
-                        //     if MONO {
-                        //         *buf.get_unchecked_mut(i * 8 + idx) += sample * mono;
-                        //     } else {
-                        //         *buf.get_unchecked_mut(i * 16 + idx * 2) += sample * left;
-                        //         *buf.get_unchecked_mut(i * 16 + idx * 2 + 1) += sample * right;
-                        //     }
-                        // }
-
-                        // TODO: Wait for float_algebraic and rely on compiler, not this ugly code.
-                        // Because above code can use AVX512, and use 2 less instructions in arm64.
-                        // Still though, this saves 1 or 2 instructions.
-                        if MONO {
-                            let mono_out = result;
-                            let buf_1_ptr = buf.as_mut_ptr().add(i * 8);
-                            let buf_1 = buf_1_ptr.cast::<f32x8>().read_unaligned();
-                            let buf_1_res = mono_out.mul_add(f32x8::splat(mono), buf_1);
-                            buf_1_ptr.cast::<f32x8>().write_unaligned(buf_1_res);
-                        } else {
-                            let r = result.to_array();
-                            // Hopefully compiler optimizes this into vector permutation
-                            let stereo_out = (
-                                f32x8::from([r[0], r[0], r[1], r[1], r[2], r[2], r[3], r[3]]),
-                                f32x8::from([r[4], r[4], r[5], r[5], r[6], r[6], r[7], r[7]]),
-                            );
-                            let stereo_vol =
-                                f32x8::from([left, right, left, right, left, right, left, right]);
-                            let ptr = buf.as_mut_ptr();
-                            let buf_1_ptr = ptr.add(i * 16);
-                            let buf_2_ptr = ptr.add(i * 16 + 8);
-                            let buf_1 = buf_1_ptr.cast::<f32x8>().read_unaligned();
-                            let buf_2 = buf_2_ptr.cast::<f32x8>().read_unaligned();
-                            let buf_1_res = stereo_out.0.mul_add(stereo_vol, buf_1);
-                            let buf_2_res = stereo_out.1.mul_add(stereo_vol, buf_2);
-                            buf_1_ptr.cast::<f32x8>().write_unaligned(buf_1_res);
-                            buf_2_ptr.cast::<f32x8>().write_unaligned(buf_2_res);
-                        }
-                    }
-
-                    if DRUM && pos.0 >= cur_wave.len() as u32 + I::INTERP_REMNANT {
-                        cold_path();
-                        self.cur_len = 0;
-                        self.phase_inc = 0;
-                        return;
-                    }
-                }
-
-                self.phase_acc = pos.0;
-                self.phase_acc_sub = pos_sub;
-                if !DRUM && self.pi {
-                    self.cur_len -= n as u32;
-                }
-            }
-        }
-        #[cfg(not(feature = "simd"))]
-        {
-            let inc = self.phase_inc;
-            // Safety:
-            // There is check in tick() method that ensures 0 <= phase_inc < len.
-            let inc_i = unsafe {
-                let i = self.phase_inc.to_int_unchecked::<i32>();
-                // Saves an instruction needed for sign extension.
-                core::hint::assert_unchecked(i >= 0);
-                i as u32
-            };
-
-            let inc_sub = inc - inc_i as f32;
-
-            let mut pos = Wrapping(self.phase_acc);
-            let mut pos_sub = self.phase_acc_sub;
-
-            for i in 0..n {
-                // Technically failing this assert does not cause UB, but just for correctness.
-                debug_assert!((0.0..1.0).contains(&pos_sub));
+        for chunk in buf.chunks_mut(if MONO { 256 } else { 512 }) {
+            for chunk in chunk.chunks_exact_mut(if MONO { 1 } else { 2 }) {
                 let sample = unsafe {
                     if DRUM {
-                        I::drum(cur_wave, pos.0, pos_sub)
+                        let base_pos = pos.0 + (pos_sub >> 24);
+                        core::hint::assert_unchecked(base_pos < 500000 + 256 * 256 + 256);
+                        core::hint::assert_unchecked((1..=500000).contains(&cur_wave.len()));
+                        let frac = (pos_sub & I24MASK) as f32 / F24;
+                        let val = I::drum(cur_wave, base_pos, frac);
+                        pos_sub += inc_sub_24;
+                        pos += inc_i;
+                        val
                     } else {
-                        // Non-DRUM cur_wave is always 256-length.
-                        I::wave(cur_wave.try_into().unwrap_unchecked(), pos.0, pos_sub)
+                        let base_pos = pos.0 >> 24;
+                        let frac = ((pos.0 & I24MASK) as f32) / F24;
+                        let val = I::wave(cur_wave.try_into().unwrap(), base_pos, frac);
+                        pos += wave_inc;
+                        val
                     }
                 };
-                // Seems compiler can't prove that no out of bounds will happen here. Interesting.
-                unsafe {
-                    if MONO {
-                        *buf.get_unchecked_mut(i) += sample * mono;
-                    } else {
-                        *buf.get_unchecked_mut(i * 2) += sample * left;
-                        *buf.get_unchecked_mut(i * 2 + 1) += sample * right;
-                    }
+                if MONO {
+                    let v = &mut chunk[0];
+                    *v = sample.mul_add(mono, *v);
+                } else {
+                    let v = &mut chunk[0];
+                    *v = sample.mul_add(left, *v);
+                    let v = &mut chunk[1];
+                    *v = sample.mul_add(right, *v);
                 }
-                pos_sub += inc_sub;
-                // We know that pos_sub is in 0..1 range so this is faster than naive integer cast.
-                let cond = pos_sub >= 1.0;
-                pos += core::hint::select_unpredictable(cond, inc_i.wrapping_add(1), inc_i);
-                pos_sub = core::hint::select_unpredictable(cond, pos_sub - 1.0, pos_sub);
-                if DRUM && pos.0 >= cur_wave.len() as u32 + I::INTERP_REMNANT {
+            }
+            if DRUM {
+                pos += pos_sub >> 24;
+                pos_sub &= I24MASK;
+                if pos.0 >= cur_wave.len() as u32 + I::INTERP_REMNANT {
                     self.cur_len = 0;
+                    self.phase_inc = 0;
                     return;
                 }
             }
-            self.phase_acc = pos.0;
-            self.phase_acc_sub = pos_sub;
-            if !DRUM && self.pi {
-                self.cur_len -= n as u32;
-            }
+        }
+
+        self.phase_acc = pos.0;
+        self.phase_acc_sub = pos_sub;
+        if !DRUM && self.pi {
+            self.cur_len -= n as u32;
         }
     }
 }
@@ -1045,9 +741,9 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
                 tuning: song_reader.read_i16(offset),
                 pi,
                 n_events: if valid_wave { n_events } else { 0 }, // Must be 0 for invalid wave
-                phase_inc: AccTy::default(),
+                phase_inc: 0,
                 phase_acc: 0,
-                phase_acc_sub: AccTy::default(),
+                phase_acc_sub: 0,
                 cur_pan: 0,
                 cur_vol: 0,
                 cur_len: 0,
@@ -1081,9 +777,9 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
                 tuning: song_reader.read_i16(offset),
                 pi,
                 n_events: if valid_wave { n_events } else { 0 }, // Must be 0 for invalid wave
-                phase_inc: AccTy::default(),
+                phase_inc: 0,
                 phase_acc: 0,
-                phase_acc_sub: AccTy::default(),
+                phase_acc_sub: 0,
                 cur_pan: 0,
                 cur_vol: 0,
                 cur_len: 0,
