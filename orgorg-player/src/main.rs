@@ -163,7 +163,7 @@ fn find_config(device: &Device, config: &AudioConfig) -> Result<StreamConfig> {
         if supported_config.channels() != channels {
             continue;
         }
-        if let Some(config) = supported_config.try_with_sample_rate(SampleRate(config.rate)) {
+        if let Some(config) = supported_config.try_with_sample_rate(config.rate) {
             return Ok(config.config());
         }
     }
@@ -232,14 +232,14 @@ fn player(
 ) -> Result<()> {
     let channels = config.channels;
 
-    let mut player = make_dyn_orgplay(org, soundbank, interp, config.sample_rate.0)?;
+    let mut player = make_dyn_orgplay(org, soundbank, interp, config.sample_rate)?;
     let (loop_start, loop_end) = player.get_loop();
     control.loop_start.store(loop_start, Ordering::Relaxed);
     control.loop_end.store(loop_end, Ordering::Relaxed);
 
     let ctrl = control.clone();
     let stream = device.build_output_stream(
-        &config,
+        config,
         move |data: &mut [f32], _| {
             if ctrl.paused.load(Ordering::Relaxed) {
                 return;
