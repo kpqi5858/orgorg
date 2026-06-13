@@ -717,10 +717,8 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
                             }
                         }
 
-                        pos_sub += inc_sub * simd_path_rem as f32;
-                        let sub_i = pos_sub.to_int_unchecked::<i32>();
-                        pos_sub -= sub_i as f32;
-                        pos += inc_i * simd_path_rem as u32 + sub_i as u32;
+                        pos_sub = sub_frac.to_array()[simd_path_rem];
+                        pos = Wrapping(base_pos.to_array()[simd_path_rem]);
                     } else {
                         // Compiler is able to autovectorize below code nicely,
                         // but obviously does not emit fma.
@@ -761,7 +759,6 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
                             buf_2_ptr.cast::<f32x8>().write_unaligned(buf_2_res);
                         }
 
-                        // Intentional code duplication since it was faster.
                         pos_sub += inc_sub * 8.0;
                         let sub_i = pos_sub.to_int_unchecked::<i32>();
                         pos_sub -= sub_i as f32;
