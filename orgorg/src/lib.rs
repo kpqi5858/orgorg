@@ -38,6 +38,19 @@
 //! And see [`wdb`](https://github.com/kpqi5858/orgorg/blob/main/orgorg-player/src/wdb.rs)
 //! module in orgorg-player for loading `soundbank.wdb`.
 //!
+//! # Cargo Features: `simd`
+//!
+//! Uses [`wide`](https://crates.io/crates/wide) crate for synthesis with 8-lane SIMD,
+//! which may gain performance where the platform can benefit from it.
+//!
+//! On my x86 PC with AVX2 and Raspberry Pi 5, it yields ~1.8x speedup.
+//!
+//! Keep in mind that:
+//! - There is no built-in multiversioning.
+//! - If the platform or build configuration does not support SIMD well,
+//!   it can result in worse performance due to scalar emulation of SIMD instructions.
+//! - The output may differ slightly between `simd` and non-`simd`.
+//!
 //! # Performance
 //! It is fast and does not allocate memory at all. But with following caveats.
 //!
@@ -48,7 +61,7 @@
 //! - As you might guessed from generic `OrgPlay` type,
 //!   constructing many variants of `OrgPlay` may lead to size bloat.
 
-use core::{cmp, marker::PhantomData, mem::MaybeUninit, ptr::NonNull};
+use core::{cmp, marker::PhantomData, mem::MaybeUninit, num::Wrapping, ptr::NonNull};
 
 const MASTER_VOLUME: f32 = 1.0 / (1 << 19) as f32;
 
@@ -93,7 +106,7 @@ pub trait CaveStoryAssetProvider {
 /// - Return value of [`SoundbankProvider::is_drum_valid`]
 ///   must be consistent for given `idx` across all calls.
 /// - If [`SoundbankProvider::is_drum_valid`] returns `true` for given `idx`,
-///   [`SoundbankProvider::get_drum`] must return a slice with `[16, 500000]` length,
+///   [`SoundbankProvider::get_drum`] must return a slice with `[1, 500000]` length,
 ///   and its length must be consistent across all calls.
 ///
 /// In other words, don't tamper with outputs using interior mutability or external source.
@@ -180,7 +193,7 @@ impl<'a> Soundbank<'a> {
     /// Creates new Soundbank.
     ///
     /// - More than 255 `drums` is effectively ignored.
-    /// - If length of a drum is not in `[16, 500000]`,
+    /// - If length of a drum is not in `[1, 500000]`,
     ///   that particular drum is considered invalid and won't play a sound.
     pub fn new(wavetable: &'a [u8; 25600], drums: &'a [&'a [i8]]) -> Self {
         Self { wavetable, drums }
@@ -197,7 +210,7 @@ unsafe impl SoundbankProvider for Soundbank<'_> {
     #[inline(always)]
     fn is_drum_valid(&self, idx: u8) -> bool {
         let len = self.drums.get(idx as usize).map(|x| x.len()).unwrap_or(0);
-        (16..=500000).contains(&len)
+        (1..=500000).contains(&len)
     }
 
     #[inline(always)]
@@ -207,81 +220,255 @@ unsafe impl SoundbankProvider for Soundbank<'_> {
 }
 
 /// Interpolation for Organya Music synthesis.
+///
+/// Keep in mind that these functions are called at audio rate.
+/// You would like to put `#[inline]` and optimize them really well.
 pub trait OrgInterpolation {
-    /// Interpolate the `wave` from `(pos).(frac)`. **This function is called at audio rate**.
-    /// # Safety
-    /// Caller must guarantee that
-    /// - `wave` is 256-length wave or `[16, 500000]` length sample,
-    /// - `pos < wave.len()`.
+    /// Interpolate the `wave` from `(pos).(frac)`.
     ///
-    /// These strict requirements can enable more performant code.
-    unsafe fn interpolate(wave: &[i8], pos: u32, frac: f32) -> f32;
+    /// `pos` should be wrapped by 256 (`& 0xff`) before indexing.
+    #[cfg(not(feature = "simd"))]
+    fn wave(wave: &[i8; 256], pos: u32, frac: f32) -> f32;
+
+    /// Interpolate the `drum` from `(pos).(frac)`.
+    ///
+    /// Out of bounds `drum` read should be 0.
+    ///
+    /// If `drum.len()` is too big (Exact value is not specified, but not greater than
+    /// [`SoundbankProvider::get_drum`] requirement), it can produce incorrect result.
+    #[cfg(not(feature = "simd"))]
+    fn drum(drum: &[i8], pos: u32, frac: f32) -> f32;
+
+    /// Interpolate the `wave` from `(pos).(frac)`, in 8-lane.
+    ///
+    /// `pos` should be wrapped by 256 (`& 0xff`) before indexing.
+    #[cfg(feature = "simd")]
+    fn wave_simd(wave: &[i8; 256], pos: wide::u32x8, frac: wide::f32x8) -> wide::f32x8;
+
+    /// Interpolate the `drum` from `(pos).(frac)`, in 8-lane.
+    ///
+    /// Out of bounds `drum` read should be 0.
+    ///
+    /// If `drum.len()` is too big (Exact value is not specified, but not greater than
+    /// [`SoundbankProvider::get_drum`] requirement), it can produce incorrect result.
+    ///
+    /// # Safety
+    /// `drum` must not be empty slice.
+    #[cfg(feature = "simd")]
+    unsafe fn drum_simd(drum: &[i8], pos: wide::u32x8, frac: wide::f32x8) -> wide::f32x8;
 }
 
 /// Builtin [`OrgInterpolation`] implementations.
 pub mod interp_impls {
-    use super::OrgInterpolation;
     /// Linear Interpolation. Fast.
     pub struct Linear;
-
-    impl OrgInterpolation for Linear {
-        #[inline(always)]
-        unsafe fn interpolate(wave: &[i8], pos: u32, frac: f32) -> f32 {
-            let len = wave.len();
-            // Safety: Caller upholds.
-            unsafe {
-                let pos_idx = pos as usize;
-                let sample1 = *wave.get_unchecked(pos_idx);
-                let sample2 = *wave.get_unchecked((pos_idx + 1) % len);
-                // The "imprecise" lerp (see Wikipedia Linear Interpolation).
-                // Monotonic, and slightly fast over "precise" one.
-                sample1 as f32 + ((sample2 as i32) - (sample1 as i32)) as f32 * frac
-            }
-        }
-    }
 
     /// No Interpolation. Fastest.
     pub struct NoInterp;
 
-    impl OrgInterpolation for NoInterp {
-        #[inline(always)]
-        unsafe fn interpolate(wave: &[i8], pos: u32, _frac: f32) -> f32 {
-            // Safety: Caller upholds.
-            unsafe { *wave.get_unchecked(pos as usize) as f32 }
+    /// Lagrange Interpolation. Slow.
+    pub struct Lagrange;
+}
+
+#[cfg(feature = "simd")]
+mod _interp_impls {
+    use wide::{CmpLe, f32x8, u32x8};
+
+    use super::OrgInterpolation;
+    use super::interp_impls::*;
+
+    // Helper functions
+
+    #[inline(always)]
+    fn retrieve_wave_data(cur_wave: &[i8; 256], base_pos: u32x8) -> f32x8 {
+        unsafe {
+            let base_pos = (base_pos & u32x8::splat(0xff)).to_array();
+            // If cur_wave were f32 slice, _mm256_i32gather_ps can be used here.
+            // This generates 8 read instructions, compared to single VGATHERDPS.
+            // But i8 array is friendlier to cpu caches, so I guess cancels out.
+            // Also compiler is smart enough to vectorize i8 to f32 cast here.
+            f32x8::from(core::array::from_fn(|i| {
+                *cur_wave.get_unchecked(base_pos[i] as usize) as f32
+            }))
         }
     }
 
-    /// Lagrange Interpolation. Slow.
-    pub struct Lagrange;
+    /// Safety: cur_wave must not be empty
+    #[inline(always)]
+    unsafe fn retrieve_drum_data(cur_wave: &[i8], base_pos: u32x8) -> f32x8 {
+        unsafe {
+            let cmp = u32x8::splat(cur_wave.len() as u32 - 1);
+            // Casting mask
+            let in_bounds: f32x8 = core::mem::transmute(base_pos.simd_le(cmp));
+            let base_pos = base_pos.min(cmp).to_array();
+            let vals = f32x8::from(core::array::from_fn(|i| {
+                *cur_wave.get_unchecked(base_pos[i] as usize) as f32
+            }));
+            in_bounds.blend(vals, f32x8::splat(0.0))
+        }
+    }
+
+    impl OrgInterpolation for Linear {
+        #[inline(always)]
+        fn wave_simd(wave: &[i8; 256], pos: u32x8, frac: f32x8) -> f32x8 {
+            let wave_data1 = retrieve_wave_data(wave, pos);
+            let wave_data2 = retrieve_wave_data(wave, pos + u32x8::splat(1));
+            // Linear Interpolation
+            (wave_data2 - wave_data1).mul_add(frac, wave_data1)
+        }
+
+        #[inline(always)]
+        unsafe fn drum_simd(drum: &[i8], pos: u32x8, frac: f32x8) -> f32x8 {
+            unsafe {
+                let wave_data1 = retrieve_drum_data(drum, pos);
+                let wave_data2 = retrieve_drum_data(drum, pos + u32x8::splat(1));
+                // Linear Interpolation
+                (wave_data2 - wave_data1).mul_add(frac, wave_data1)
+            }
+        }
+    }
+
+    impl OrgInterpolation for NoInterp {
+        #[inline(always)]
+        fn wave_simd(wave: &[i8; 256], pos: u32x8, _frac: f32x8) -> f32x8 {
+            retrieve_wave_data(wave, pos)
+        }
+
+        #[inline(always)]
+        unsafe fn drum_simd(drum: &[i8], pos: u32x8, _frac: f32x8) -> f32x8 {
+            unsafe { retrieve_drum_data(drum, pos) }
+        }
+    }
 
     impl OrgInterpolation for Lagrange {
         #[inline(always)]
-        unsafe fn interpolate(wave: &[i8], pos: u32, frac: f32) -> f32 {
-            // Safety: Caller upholds.
+        fn wave_simd(wave: &[i8; 256], pos: u32x8, frac: f32x8) -> f32x8 {
+            let s1 = retrieve_wave_data(wave, pos - u32x8::splat(1));
+            let s2 = retrieve_wave_data(wave, pos);
+            let s3 = retrieve_wave_data(wave, pos + u32x8::splat(1));
+            let s4 = retrieve_wave_data(wave, pos + u32x8::splat(2));
+
+            let c0 = s2;
+            let c1 = s4.mul_add(
+                f32x8::splat(-1.0 / 6.0),
+                s2.mul_add(
+                    f32x8::splat(-1.0 / 2.0),
+                    s1.mul_add(f32x8::splat(-1.0 / 3.0), s3),
+                ),
+            );
+            let c2 = (s1 + s3).mul_sub(f32x8::splat(1.0 / 2.0), s2);
+            let c3 =
+                (s4 - s1).mul_add(f32x8::splat(1.0 / 6.0), (s2 - s3) * f32x8::splat(1.0 / 2.0));
+
+            ((c3.mul_add(frac, c2)).mul_add(frac, c1)).mul_add(frac, c0)
+        }
+
+        #[inline(always)]
+        unsafe fn drum_simd(drum: &[i8], pos: u32x8, frac: f32x8) -> f32x8 {
             unsafe {
-                let len = wave.len();
-                let pos = pos as usize;
-                let s1 = *wave.get_unchecked(if pos == 0 { len - 1 } else { pos - 1 }) as f32;
-                let s2 = *wave.get_unchecked(pos) as f32;
-                let s3 = *wave.get_unchecked((pos + 1) % len) as f32;
-                // Compiler should optimize this branchless, which is faster than (pos + 2) % idx.
-                // (pos + 1) % len is already branchless.
-                let s4_idx = if pos + 2 == len + 1 {
-                    1
-                } else if pos + 2 == len {
-                    0
-                } else {
-                    pos + 2
-                };
-                let s4 = *wave.get_unchecked(s4_idx) as f32;
+                let s1 = retrieve_drum_data(drum, pos - u32x8::splat(1));
+                let s2 = retrieve_drum_data(drum, pos);
+                let s3 = retrieve_drum_data(drum, pos + u32x8::splat(1));
+                let s4 = retrieve_drum_data(drum, pos + u32x8::splat(2));
 
                 let c0 = s2;
-                let c1 = s3 - s1 * (1.0 / 3.0) - s2 * (1.0 / 2.0) - s4 * (1.0 / 6.0);
-                let c2 = (s1 + s3) * (1.0 / 2.0) - s2;
-                let c3 = (s4 - s1) * (1.0 / 6.0) + (s2 - s3) * (1.0 / 2.0);
+                let c1 = s4.mul_add(
+                    f32x8::splat(-1.0 / 6.0),
+                    s2.mul_add(
+                        f32x8::splat(-1.0 / 2.0),
+                        s1.mul_add(f32x8::splat(-1.0 / 3.0), s3),
+                    ),
+                );
+                let c2 = (s1 + s3).mul_sub(f32x8::splat(1.0 / 2.0), s2);
+                let c3 =
+                    (s4 - s1).mul_add(f32x8::splat(1.0 / 6.0), (s2 - s3) * f32x8::splat(1.0 / 2.0));
 
-                ((c3 * frac + c2) * frac + c1) * frac + c0
+                ((c3.mul_add(frac, c2)).mul_add(frac, c1)).mul_add(frac, c0)
             }
+        }
+    }
+}
+
+#[cfg(not(feature = "simd"))]
+mod _interp_impls {
+    use super::OrgInterpolation;
+    use super::interp_impls::*;
+
+    impl OrgInterpolation for Linear {
+        #[inline(always)]
+        fn wave(wave: &[i8; 256], pos: u32, frac: f32) -> f32 {
+            let idx1 = pos & 0xff;
+            let sample1 = wave[idx1 as usize];
+            let idx2 = pos.wrapping_add(1) & 0xff;
+            let sample2 = wave[idx2 as usize];
+            // The "imprecise" lerp (see Wikipedia Linear Interpolation).
+            // Monotonic, and slightly fast over "precise" one.
+            sample1 as f32 + ((sample2 as i32) - (sample1 as i32)) as f32 * frac
+        }
+
+        #[inline(always)]
+        fn drum(drum: &[i8], pos: u32, frac: f32) -> f32 {
+            let sample1 = drum.get(pos as usize).copied().unwrap_or(0);
+            let sample2 = drum.get(pos as usize + 1).copied().unwrap_or(0);
+            sample1 as f32 + ((sample2 as i32) - (sample1 as i32)) as f32 * frac
+        }
+    }
+
+    impl OrgInterpolation for NoInterp {
+        #[inline(always)]
+        fn wave(wave: &[i8; 256], pos: u32, _frac: f32) -> f32 {
+            wave[(pos & 0xff) as usize] as f32
+        }
+
+        #[inline(always)]
+        fn drum(drum: &[i8], pos: u32, _frac: f32) -> f32 {
+            drum.get(pos as usize).copied().unwrap_or(0) as f32
+        }
+    }
+
+    impl OrgInterpolation for Lagrange {
+        #[inline(always)]
+        fn wave(wave: &[i8; 256], pos: u32, frac: f32) -> f32 {
+            #[rustfmt::skip]
+            let idx = [
+                pos.wrapping_sub(1) as usize & 0xff,
+                pos                 as usize & 0xff,
+                pos.wrapping_sub(1) as usize & 0xff,
+                pos.wrapping_sub(2) as usize & 0xff,
+            ];
+            let s1 = wave[idx[0]] as f32;
+            let s2 = wave[idx[1]] as f32;
+            let s3 = wave[idx[2]] as f32;
+            let s4 = wave[idx[3]] as f32;
+
+            let c0 = s2;
+            let c1 = s3 - s1 * (1.0 / 3.0) - s2 * (1.0 / 2.0) - s4 * (1.0 / 6.0);
+            let c2 = (s1 + s3) * (1.0 / 2.0) - s2;
+            let c3 = (s4 - s1) * (1.0 / 6.0) + (s2 - s3) * (1.0 / 2.0);
+
+            ((c3 * frac + c2) * frac + c1) * frac + c0
+        }
+
+        #[inline(always)]
+        fn drum(drum: &[i8], pos: u32, frac: f32) -> f32 {
+            #[rustfmt::skip]
+            let idx = [
+                pos.wrapping_sub(1) as usize,
+                pos                 as usize,
+                pos.wrapping_sub(1) as usize,
+                pos.wrapping_sub(2) as usize,
+            ];
+            let s1 = drum.get(idx[0]).copied().unwrap_or(0) as f32;
+            let s2 = drum.get(idx[1]).copied().unwrap_or(0) as f32;
+            let s3 = drum.get(idx[2]).copied().unwrap_or(0) as f32;
+            let s4 = drum.get(idx[3]).copied().unwrap_or(0) as f32;
+
+            let c0 = s2;
+            let c1 = s3 - s1 * (1.0 / 3.0) - s2 * (1.0 / 2.0) - s4 * (1.0 / 6.0);
+            let c2 = (s1 + s3) * (1.0 / 2.0) - s2;
+            let c3 = (s4 - s1) * (1.0 / 6.0) + (s2 - s3) * (1.0 / 2.0);
+
+            ((c3 * frac + c2) * frac + c1) * frac + c0
         }
     }
 }
@@ -442,8 +629,6 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
     }
 
     // This function is the critical part of overall performance.
-    // Previously, there was val() method that returns a sample value, which was obviously slower.
-    // And as expected, fill_buf is ~1.6x faster than individual val() calls
     fn fill_buf<A: SoundbankProvider, const MONO: bool>(&mut self, buf: &mut [f32], a: &A) {
         if self.cur_len == 0 {
             return;
@@ -460,8 +645,7 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
                 core::slice::from_raw_parts(w.add(idx).cast(), 256)
             }
         };
-        debug_assert!((16..=500000).contains(&cur_wave.len()));
-        let len = cur_wave.len() as u32;
+        debug_assert!((1..=500000).contains(&cur_wave.len()));
         let vol = self.cur_vol as i32;
         // Integer multiplication then float cast is slightly faster
         let left = ((self.cur_pan >> 4) as i32 * vol) as f32 * MASTER_VOLUME;
@@ -483,45 +667,149 @@ impl<'a, I: OrgInterpolation, const DRUM: bool> Instrument<'a, I, DRUM> {
             core::hint::assert_unchecked(i >= 0);
             i as u32
         };
+
         let inc_sub = inc - inc_i as f32;
-        let mut pos = self.phase_acc;
+
+        let mut pos = Wrapping(self.phase_acc);
         let mut pos_sub = self.phase_acc_sub;
-        for i in 0..n {
-            // Safety:
-            // SoundbankProvider never return invalid length array.
-            // There is check in tick() method that ensures 0 <= phase_inc < len.
-            // And at the end of this for loop, pos is wrapped.
-            // Therefore, pos < len.
-            let sample = unsafe {
-                debug_assert!(pos < len);
-                // Technically failing this assert does not cause UB, but just for correctness.
-                debug_assert!((0.0..1.0).contains(&pos_sub));
-                I::interpolate(cur_wave, pos, pos_sub)
-            };
-            // Seems compiler can't prove that no out of bounds will happen here. Interesting.
+
+        #[cfg(feature = "simd")]
+        {
+            use wide::{f32x8, u32x8};
+
+            // Usually remainder seems to be processed in scalar, but it was slower in my benchmark.
+            let simd_path_cnt = n.div_ceil(8);
+            let simd_path_rem = n % 8;
             unsafe {
-                if MONO {
-                    *buf.get_unchecked_mut(i) += sample * mono;
-                } else {
-                    *buf.get_unchecked_mut(i * 2) += sample * left;
-                    *buf.get_unchecked_mut(i * 2 + 1) += sample * right;
+                for i in 0..simd_path_cnt {
+                    let lane: u32x8 = [0, 1, 2, 3, 4, 5, 6, 7].into();
+                    let base_pos = u32x8::splat(pos.0) + lane * u32x8::splat(inc_i);
+                    let lane: f32x8 = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0].into();
+                    let sub_pos = lane.mul_add(f32x8::splat(inc_sub), f32x8::splat(pos_sub));
+                    // i32 to u32 cast
+                    let sub_pos_i: u32x8 = core::mem::transmute(sub_pos.fast_trunc_int());
+                    let sub_floor: f32x8 = sub_pos.floor();
+
+                    let base_pos = base_pos + sub_pos_i;
+                    let sub_frac = sub_pos - sub_floor;
+
+                    let result = if DRUM {
+                        I::drum_simd(cur_wave, base_pos, sub_frac)
+                    } else {
+                        // Non-DRUM cur_wave is always 256-length.
+                        I::wave_simd(cur_wave.try_into().unwrap_unchecked(), base_pos, sub_frac)
+                    };
+
+                    if i == simd_path_cnt - 1 && simd_path_rem != 0 {
+                        // We calculated excess. Writing them all will cause oob write.
+                        for (idx, sample) in result
+                            .to_array()
+                            .into_iter()
+                            .take(simd_path_rem)
+                            .enumerate()
+                        {
+                            // TODO: Would like to use fma here. Wait for float_algebraic.
+                            if MONO {
+                                *buf.get_unchecked_mut(i * 8 + idx) += sample * mono;
+                            } else {
+                                *buf.get_unchecked_mut(i * 16 + idx * 2) += sample * left;
+                                *buf.get_unchecked_mut(i * 16 + idx * 2 + 1) += sample * right;
+                            }
+                        }
+
+                        pos_sub += inc_sub * simd_path_rem as f32;
+                        let sub_i = pos_sub.to_int_unchecked::<i32>();
+                        pos_sub -= sub_i as f32;
+                        pos += inc_i * simd_path_rem as u32 + sub_i as u32;
+                    } else {
+                        // Compiler is able to autovectorize below code nicely,
+                        // but obviously does not emit fma.
+                        // for (idx, sample) in result.to_array().into_iter().enumerate() {
+                        //     if MONO {
+                        //         *buf.get_unchecked_mut(i * 8 + idx) += sample * mono;
+                        //     } else {
+                        //         *buf.get_unchecked_mut(i * 16 + idx * 2) += sample * left;
+                        //         *buf.get_unchecked_mut(i * 16 + idx * 2 + 1) += sample * right;
+                        //     }
+                        // }
+
+                        // TODO: Wait for float_algebraic and rely on compiler, not this ugly code.
+                        // Because above code can use AVX512, and use 2 less instructions in arm64.
+                        // Still though, this saves 1 or 2 instructions.
+                        if MONO {
+                            let mono_out = result;
+                            let buf_1_ptr = buf.as_mut_ptr().add(i * 8);
+                            let buf_1 = buf_1_ptr.cast::<f32x8>().read_unaligned();
+                            let buf_1_res = mono_out.mul_add(f32x8::splat(mono), buf_1);
+                            buf_1_ptr.cast::<f32x8>().write_unaligned(buf_1_res);
+                        } else {
+                            let r = result.to_array();
+                            // Hopefully compiler optimizes this into vector permutation
+                            let stereo_out = (
+                                f32x8::from([r[0], r[0], r[1], r[1], r[2], r[2], r[3], r[3]]),
+                                f32x8::from([r[4], r[4], r[5], r[5], r[6], r[6], r[7], r[7]]),
+                            );
+                            let stereo_vol =
+                                f32x8::from([left, right, left, right, left, right, left, right]);
+                            let buf_1_ptr = buf.as_mut_ptr().add(i * 16);
+                            let buf_2_ptr = buf.as_mut_ptr().add(i * 16 + 8);
+                            let buf_1 = buf_1_ptr.cast::<f32x8>().read_unaligned();
+                            let buf_2 = buf_2_ptr.cast::<f32x8>().read_unaligned();
+                            let buf_1_res = stereo_out.0.mul_add(stereo_vol, buf_1);
+                            let buf_2_res = stereo_out.1.mul_add(stereo_vol, buf_2);
+                            buf_1_ptr.cast::<f32x8>().write_unaligned(buf_1_res);
+                            buf_2_ptr.cast::<f32x8>().write_unaligned(buf_2_res);
+                        }
+
+                        // Intentional code duplication since it was faster.
+                        pos_sub += inc_sub * 8.0;
+                        let sub_i = pos_sub.to_int_unchecked::<i32>();
+                        pos_sub -= sub_i as f32;
+                        pos += inc_i * 8 + sub_i as u32;
+                    }
+
+                    if DRUM && pos.0 >= cur_wave.len() as u32 {
+                        self.cur_len = 0;
+                        return;
+                    }
                 }
-            }
-            pos_sub += inc_sub;
-            // We know that pos_sub is in 0..1 range so this is faster than naive integer cast.
-            let val = if pos_sub >= 1.0 { 1 } else { 0 };
-            pos += val as u32 + inc_i;
-            pos_sub -= val as f32;
-            if pos >= len {
-                // Drums only play once.
-                if DRUM {
-                    self.cur_len = 0;
-                    break;
-                }
-                pos -= len;
             }
         }
-        self.phase_acc = pos;
+        #[cfg(not(feature = "simd"))]
+        {
+            for i in 0..n {
+                // Technically failing this assert does not cause UB, but just for correctness.
+                debug_assert!((0.0..1.0).contains(&pos_sub));
+                let sample = unsafe {
+                    if DRUM {
+                        I::drum(cur_wave, pos.0, pos_sub)
+                    } else {
+                        // Non-DRUM cur_wave is always 256-length.
+                        I::wave(cur_wave.try_into().unwrap_unchecked(), pos.0, pos_sub)
+                    }
+                };
+                // Seems compiler can't prove that no out of bounds will happen here. Interesting.
+                unsafe {
+                    if MONO {
+                        *buf.get_unchecked_mut(i) += sample * mono;
+                    } else {
+                        *buf.get_unchecked_mut(i * 2) += sample * left;
+                        *buf.get_unchecked_mut(i * 2 + 1) += sample * right;
+                    }
+                }
+                pos_sub += inc_sub;
+                // We know that pos_sub is in 0..1 range so this is faster than naive integer cast.
+                let val = if pos_sub >= 1.0 { 1 } else { 0 };
+                pos += val as u32 + inc_i;
+                pos_sub -= val as f32;
+                if DRUM && pos.0 >= cur_wave.len() as u32 {
+                    self.cur_len = 0;
+                    return;
+                }
+            }
+        }
+
+        self.phase_acc = pos.0;
         self.phase_acc_sub = pos_sub;
         if !DRUM {
             self.cur_len -= n as u32;
@@ -828,6 +1116,9 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
             // );
             // So, manual branching here.
             let to_fill_raw = if MONO {
+                // TODO: Drop libm dependency when core_float_math lands,
+                // since this is the only place libm is used,
+                // and this will block generating native ceil instruction.
                 cmp::min(
                     libm::ceilf(self.remaining_samples) as usize,
                     buf.len() - filled_raw,

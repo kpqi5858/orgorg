@@ -119,6 +119,7 @@ fn test1() {
             .build(song)
             .unwrap();
         // Is output of synthesis output consistent with buffer size?
+        // FIXME: simd may not be exact here
         let mut buf_synth_splited = vec![];
         while buf_synth_splited.len() < buf_len {
             let mut buf2 =

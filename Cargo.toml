@@ -4,4 +4,4 @@ members = ["orgorg", "orgorg-player", "orgorg-bench"]
 
 [profile.release]
 panic = "abort"
-# lto = "thin"
+lto = "thin"

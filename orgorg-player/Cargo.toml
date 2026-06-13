@@ -6,7 +6,7 @@ publish = false
 license = "MIT"
 
 [dependencies]
-orgorg = { path = "../orgorg" }
+orgorg = { path = "../orgorg", features = ["simd"] }
 
 md5 = "0.8.0"
 anyhow = "1.0.100"
