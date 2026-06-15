@@ -66,7 +66,11 @@ struct AudioConfig {
 #[derive(Subcommand)]
 enum Commands {
     /// Dump wavetable and drums needed for OrgPlay
-    Dump,
+    Dump {
+        /// Dump as f32 for `f32smp` cargo feature.
+        #[arg(long)]
+        f32: bool,
+    },
     /// Play .org music
     Play {
         path: PathBuf,
@@ -371,15 +375,24 @@ fn main() -> Result<()> {
     let args = Cli::parse();
 
     match args.command {
-        Commands::Dump => {
+        Commands::Dump { f32 } => {
             let exe = args.sound.unwrap_or(PathBuf::from("./Doukutsu.exe"));
             let asset_by_dump =
                 dump_and_synth(&exe).context("Cannot extract sound from Doukutsu.exe")?;
-            let data: &[u8] = zerocopy::transmute_ref!(asset_by_dump.0.as_slice());
-            std::fs::write("./wavetable.dat", data)?;
+            let wavetable_f32 = asset_by_dump.0.map(|i| i as f32);
+            let drums_f32 = asset_by_dump.0.map(|i| i as f32);
+            let wavetable: &[u8];
+            let drums: &[u8];
+            if f32 {
+                wavetable = zerocopy::transmute_ref!(wavetable_f32.as_slice());
+                drums = zerocopy::transmute_ref!(drums_f32.as_slice());
+            } else {
+                wavetable = zerocopy::transmute_ref!(asset_by_dump.0.as_slice());
+                drums = zerocopy::transmute_ref!(asset_by_dump.1.as_slice());
+            }
+            std::fs::write("./wavetable.dat", wavetable)?;
             println!("Wrote wavetables to ./wavetable.dat");
-            let data: &[u8] = zerocopy::transmute_ref!(asset_by_dump.1.as_slice());
-            std::fs::write("./drums.dat", data)?;
+            std::fs::write("./drums.dat", drums)?;
             println!("Wrote drums to ./drums.dat");
             Ok(())
         }
