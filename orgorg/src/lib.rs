@@ -1,5 +1,5 @@
 #![cfg_attr(not(feature = "fma"), no_std)]
-#![cfg_attr(feature = "fma-nightly", feature(core_float_math))]
+#![cfg_attr(feature = "fma-nightly", feature(float_algebraic))]
 
 //! `no_std` compatible Cave Story Organya Music Player.
 //!
@@ -46,7 +46,7 @@
 //! Uses Fused Multiply Add where possible, which might improve performance if the platform supports it.
 //!
 //! - `fma` requires `std`.
-//! - `fma-nightly` does not require `std` but requires nightly compiler.
+//! - `fma-nightly` does not require `std` but requires nightly compiler. It can be non-deterministic.
 //!
 //! # Cargo Features: `f32smp`
 //!
@@ -268,7 +268,7 @@ impl FmaUtils for f32 {
         #[cfg(feature = "fma")]
         return self.mul_add(a, b);
         #[cfg(feature = "fma-nightly")]
-        return core::f32::math::mul_add(self, a, b);
+        return self.algebraic_mul(a).algebraic_add(b);
         return (self * a) + b;
     }
 }
@@ -426,6 +426,32 @@ mod _interp_impls {
             let s4 = drum.get_or_zero(idx[3]);
 
             lagrange(s1, s2, s3, s4, frac)
+        }
+    }
+
+    #[cfg(test)]
+    mod test {
+        #[test]
+        fn gather_utils() {
+            use super::GatherUtils;
+
+            let arr: &[f32] = &[1.0; 8];
+            assert_eq!(arr.get_or_zero(0), 1.0);
+            assert_eq!(arr.get_or_zero(8), 0.0);
+            assert_eq!(unsafe { arr.get_as_f32(0) }, 1.0);
+
+            let arr: &[i8] = &[1; 8];
+            assert_eq!(arr.get_or_zero(0), 1.0);
+            assert_eq!(arr.get_or_zero(8), 0.0);
+            assert_eq!(unsafe { arr.get_as_f32(0) }, 1.0);
+
+            let arr: &[f32] = &[];
+            assert_eq!(arr.get_or_zero(0), 0.0);
+            assert_eq!(arr.get_or_zero(8), 0.0);
+
+            let arr: &[i8] = &[];
+            assert_eq!(arr.get_or_zero(0), 0.0);
+            assert_eq!(arr.get_or_zero(8), 0.0);
         }
     }
 }
@@ -1127,8 +1153,6 @@ where
 mod test {
     use super::*;
 
-    extern crate std;
-
     #[test]
     fn inst_loop() {
         let mut inst = Instrument::<false> {
@@ -1168,5 +1192,11 @@ mod test {
             NonNull::new_unchecked(notes.as_ptr() as *const u8 as *mut u8)
         });
         assert_eq!(inst.loop_event, 1);
+
+        let notes: [u32; 4] = [2, 4, 6, 8];
+        inst.calculate_loop(1, unsafe {
+            NonNull::new_unchecked(notes.as_ptr() as *const u8 as *mut u8)
+        });
+        assert_eq!(inst.loop_event, 0);
     }
 }
