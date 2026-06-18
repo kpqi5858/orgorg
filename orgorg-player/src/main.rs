@@ -380,7 +380,7 @@ fn main() -> Result<()> {
             let asset_by_dump =
                 dump_and_synth(&exe).context("Cannot extract sound from Doukutsu.exe")?;
             let wavetable_f32 = asset_by_dump.0.map(|i| i as f32);
-            let drums_f32 = asset_by_dump.0.map(|i| i as f32);
+            let drums_f32 = asset_by_dump.1.map(|i| i as f32);
             let wavetable: &[u8];
             let drums: &[u8];
             if f32 {
