@@ -473,6 +473,8 @@ struct Instrument<const DRUM: bool> {
     cur_event: u16,
     loop_event: u16,
     phase_inc: u32,
+    // For DRUM, this is integer part of phase accumulator
+    // For !DRUM, this is 8.24 phase accumulator
     phase_acc: u32,
     cur_pan: u8,
     cur_vol: u8,
@@ -667,18 +669,22 @@ impl<const DRUM: bool> Instrument<DRUM> {
         let inc_sub_24 = self.phase_inc & I24MASK;
 
         let mut pos = Wrapping(self.phase_acc);
-        let mut pos_sub = self.cur_len_or_phase_acc;
+        let mut pos_sub = Wrapping(self.cur_len_or_phase_acc);
 
         for chunk in buf.chunks_mut(if MONO { 256 } else { 512 }) {
+            let chunk_size = chunk.len() as u32 / if MONO { 1 } else { 2 };
+            // Will pos_sub overflow at the last iteration in the loop below?
+            let does_overflow = pos_sub.0.checked_add(inc_sub_24 * chunk_size).is_none();
+
             for chunk in chunk.chunks_exact_mut(if MONO { 1 } else { 2 }) {
                 let sample = unsafe {
                     if DRUM {
-                        let base_pos = pos.0 + (pos_sub >> 24);
+                        let base_pos = pos.0 + (pos_sub.0 >> 24);
                         core::hint::assert_unchecked(
                             base_pos < MAX_DRUM_LEN as u32 + 256 * 256 + 256,
                         );
                         core::hint::assert_unchecked((1..=MAX_DRUM_LEN).contains(&cur_wave.len()));
-                        let frac = (pos_sub & I24MASK) as f32 / F24;
+                        let frac = (pos_sub.0 & I24MASK) as f32 / F24;
                         let val = I::drum(cur_wave, base_pos, frac);
                         pos_sub += inc_sub_24;
                         pos += inc_i;
@@ -702,8 +708,10 @@ impl<const DRUM: bool> Instrument<DRUM> {
                 }
             }
             if DRUM {
-                pos += pos_sub >> 24;
-                pos_sub &= I24MASK;
+                pos += pos_sub.0 >> 24;
+                // Add overflowed value here
+                pos += does_overflow as u32 * 256;
+                pos_sub.0 &= I24MASK;
                 if pos.0 >= cur_wave.len() as u32 + I::INTERP_REMNANT {
                     self.phase_inc = 0;
                     return;
@@ -712,7 +720,7 @@ impl<const DRUM: bool> Instrument<DRUM> {
         }
 
         self.phase_acc = pos.0;
-        self.cur_len_or_phase_acc = pos_sub;
+        self.cur_len_or_phase_acc = pos_sub.0;
         if !DRUM && self.pi {
             self.cur_len_or_phase_acc -= n as u32;
         }
@@ -1198,5 +1206,45 @@ mod test {
             NonNull::new_unchecked(notes.as_ptr() as *const u8 as *mut u8)
         });
         assert_eq!(inst.loop_event, 0);
+    }
+
+    #[test]
+    fn drum_synth_overflow() {
+        let test_sample = core::array::from_fn(|i| i as OrgSmp);
+        struct TestSoundbank([OrgSmp; 258]);
+        unsafe impl SoundbankProvider for TestSoundbank {
+            fn wavetable(&self) -> &[OrgSmp; 25600] {
+                unreachable!()
+            }
+
+            fn is_drum_valid(&self, _idx: u8) -> bool {
+                true
+            }
+
+            unsafe fn get_drum(&self, _idx: u8) -> &[OrgSmp] {
+                &self.0
+            }
+        }
+        let soundbank = TestSoundbank(test_sample);
+
+        let mut inst = Instrument::<true> {
+            tuning: 0,
+            pi: false,
+            n_events: 0,
+            cur_event: 0,
+            loop_event: 0,
+            phase_inc: 0xffffff,
+            phase_acc: 0,
+            cur_pan: 0b00010001,
+            cur_vol: 100,
+            wave_idx: 0,
+            cur_len_or_phase_acc: 0xffffff,
+        };
+        let mut buf = [0.0; 257];
+        inst.fill_buf::<_, interp_impls::NoInterp, true>(&mut buf, &soundbank);
+        assert_eq!(inst.phase_acc, 257);
+        // (phase_inc + (phase_acc * 257)) % (2^24)
+        assert_eq!(inst.cur_len_or_phase_acc, 0xffffff - 257);
+        assert!(buf.windows(2).all(|a| { a[0] < a[1] }));
     }
 }
