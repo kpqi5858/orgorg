@@ -16,7 +16,7 @@ use std::{
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use cpal::{
-    Device, SampleRate, StreamConfig,
+    Device, StreamConfig,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
 use is_terminal::IsTerminal;
