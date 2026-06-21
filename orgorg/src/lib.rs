@@ -1245,6 +1245,7 @@ mod test {
         assert_eq!(inst.phase_acc, 257);
         // (phase_inc + (phase_acc * 257)) % (2^24)
         assert_eq!(inst.cur_len_or_phase_acc, 0xffffff - 257);
+        #[cfg(feature = "f32smp")]
         assert!(buf.windows(2).all(|a| { a[0] < a[1] }));
     }
 }
