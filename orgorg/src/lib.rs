@@ -835,7 +835,7 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
         let Some(samples_per_beat) = rate
             .checked_mul(ms_per_beat as u32)
             .and_then(|f| f.try_into().ok())
-            .and_then(|f: i32| (f <= i32::MAX / 1000 * 1000).then_some(f))
+            .filter(|f: &i32| *f <= i32::MAX / 1000 * 1000)
         else {
             return Err(OrgError::SampleRateTooHigh);
         };
