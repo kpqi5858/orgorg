@@ -90,6 +90,7 @@ const MAX_DRUM_LEN: usize = 500000;
 /// Type of drums and wavetable data.
 #[cfg(feature = "f32smp")]
 pub type OrgSmp = f32;
+/// Type of drums and wavetable data.
 #[cfg(not(feature = "f32smp"))]
 pub type OrgSmp = i8;
 
@@ -721,7 +722,7 @@ impl<const DRUM: bool> Instrument<DRUM> {
 }
 
 /// Playback option for [`OrgPlay`].
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, Debug)]
 pub enum PlayTill {
     /// Play endlessly.
     #[default]
@@ -735,6 +736,7 @@ pub enum PlayTill {
 }
 
 /// Result of [`OrgPlay`] playback, according to [`PlayTill`] option.
+#[derive(Debug)]
 pub struct PlayResult(bool, usize);
 
 impl PlayResult {
