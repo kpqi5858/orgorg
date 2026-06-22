@@ -71,10 +71,14 @@
 //! - As you might guessed from generic [`OrgPlay`] type,
 //!   constructing many variants of `OrgPlay` may lead to size bloat.
 //!
-//! If you want numbers, my x86 PC can synthesize Cave Story Main Theme at 7700x speed.
+//! If you want numbers, my x86 PC can synthesize Cave Story Main Theme at over 7800x speed.
 //! (Linear Interpolation, 48000 Hz Stereo, `fma` & `f32smp`).
 
 use core::{cmp, marker::PhantomData, mem::MaybeUninit, num::Wrapping, ptr::NonNull};
+use std::{
+    error::Error,
+    fmt::{Debug, Display},
+};
 
 const MASTER_VOLUME: f32 = 1.0 / (1 << 19) as f32;
 const MAX_DRUM_LEN: usize = 500000;
@@ -109,7 +113,7 @@ pub trait CaveStoryAssetProvider {
 ///
 /// # Safety
 /// - Return value of [`SoundbankProvider::drum`] must be consistent for given `idx` across all calls.
-/// - If [`SoundbankProvider::drum`] returns `Some`, length of the slice must be in `[1, 500000]`,
+/// - If [`SoundbankProvider::drum`] returns `Some(slice)`, length of `slice` must be in `[1, 500000]`,
 ///   and its length must be consistent across all calls.
 ///
 /// In other words, don't tamper with outputs using interior mutability or external source.
@@ -117,7 +121,7 @@ pub unsafe trait SoundbankProvider {
     /// The original `wavetable.dat` file, or 100 concatenated 256-length waves.
     fn wavetable(&self) -> &[OrgSmp; 25600];
 
-    /// Get drum sample of `idx`.
+    /// Get drum sample of `idx`, if valid.
     fn drum(&self, idx: u8) -> Option<&[OrgSmp]>;
 }
 
@@ -146,6 +150,7 @@ unsafe impl<T: CaveStoryAssetProvider> SoundbankProvider for T {
 }
 
 /// Default provider used in [`OrgPlayBuilder::with_asset`]
+#[derive(Debug)]
 pub struct AssetByRef<'a>(&'a [OrgSmp; 25600], &'a [OrgSmp; 40000]);
 
 impl CaveStoryAssetProvider for AssetByRef<'_> {
@@ -163,7 +168,7 @@ impl CaveStoryAssetProvider for AssetByRef<'_> {
 /// Custom soundbank by ref.
 ///
 /// 43 drums will play Org-03 songs properly.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Soundbank<'a> {
     wavetable: &'a [OrgSmp; 25600],
     drums: &'a [&'a [OrgSmp]],
@@ -228,12 +233,15 @@ pub trait OrgInterpolation {
 /// Builtin [`OrgInterpolation`] implementations.
 pub mod interp_impls {
     /// Linear Interpolation. Fast.
+    #[derive(Debug)]
     pub struct Linear;
 
     /// No Interpolation. Fastest.
+    #[derive(Debug)]
     pub struct NoInterp;
 
     /// Lagrange Interpolation. Slow.
+    #[derive(Debug)]
     pub struct Lagrange;
 }
 
@@ -444,6 +452,7 @@ struct Event {
     panning: u8,
 }
 
+#[derive(Debug)]
 struct Instrument<const DRUM: bool> {
     tuning: i16,
     pi: bool,
@@ -471,9 +480,9 @@ unsafe impl<const DRUM: bool> Send for Instrument<DRUM> {}
 unsafe impl<const DRUM: bool> Sync for Instrument<DRUM> {}
 
 // 8.24 fixed point arithmetic
-pub const I24: u32 = 0x1000000;
-pub const I24MASK: u32 = I24 - 1;
-pub const F24: f32 = I24 as f32;
+const I24: u32 = 0x1000000;
+const I24MASK: u32 = I24 - 1;
+const F24: f32 = I24 as f32;
 
 impl<const DRUM: bool> Instrument<DRUM> {
     // Safety: cur_event < n_events
@@ -740,6 +749,7 @@ impl PlayResult {
 }
 
 /// `no_std` compatible Cave Story Organya Music Player.
+#[derive(Debug)]
 pub struct OrgPlay<'a, I: OrgInterpolation, A: SoundbankProvider> {
     song_data: NonNull<u8>,
     _song_data_ref: PhantomData<&'a [u8]>,
@@ -758,8 +768,31 @@ pub struct OrgPlay<'a, I: OrgInterpolation, A: SoundbankProvider> {
 unsafe impl<'a, I: OrgInterpolation, A: SoundbankProvider + Send> Send for OrgPlay<'a, I, A> {}
 unsafe impl<'a, I: OrgInterpolation, A: SoundbankProvider + Sync> Sync for OrgPlay<'a, I, A> {}
 
+/// Errors that may happen when parsing Organya music and creating [`OrgPlay`].
+#[derive(Debug)]
+pub enum OrgError {
+    /// Invalid Organya song.
+    InvalidOrg,
+    /// Sample rate is too high.
+    ///
+    /// This can happen if Organya song is malformed,
+    /// or specified sample rate is greater than 1,000,000.
+    SampleRateTooHigh,
+}
+
+impl Display for OrgError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            OrgError::InvalidOrg => "Invalid Organya song",
+            OrgError::SampleRateTooHigh => "Sample rate is too high",
+        };
+        f.write_str(s)
+    }
+}
+impl Error for OrgError {}
+
 impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
-    fn new(asset: A, song: &'a [u8], rate: u32) -> Option<Self> {
+    fn new(asset: A, song: &'a [u8], rate: u32) -> Result<Self, OrgError> {
         struct UnsafeReader<'a>(&'a [u8]);
         impl<'a> UnsafeReader<'a> {
             unsafe fn new(a: &'a [u8]) -> Self {
@@ -788,26 +821,28 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
         }
 
         if song.len() < 114 {
-            return None;
+            return Err(OrgError::InvalidOrg);
         }
         if !matches!(&song[0..6], b"Org-02" | b"Org-03") {
-            return None;
+            return Err(OrgError::InvalidOrg);
         }
         // Safety: all following read is within index < 114
         let song_reader = unsafe { UnsafeReader::new(song) };
         let ms_per_beat = song_reader.read_u16(6);
         if ms_per_beat == 0 {
-            return None;
+            return Err(OrgError::InvalidOrg);
         }
-        let samples_per_beat: i32 = rate.checked_mul(ms_per_beat as u32)?.try_into().ok()?;
-        // To prevent overflow in synth method
-        if samples_per_beat > i32::MAX / 1000 * 1000 {
-            return None;
-        }
+        let Some(samples_per_beat) = rate
+            .checked_mul(ms_per_beat as u32)
+            .and_then(|f| f.try_into().ok())
+            .and_then(|f: i32| (f <= i32::MAX / 1000 * 1000).then_some(f))
+        else {
+            return Err(OrgError::SampleRateTooHigh);
+        };
         let loop_start = song_reader.read_u32(10);
         let loop_end = song_reader.read_u32(14);
         if loop_end < loop_start {
-            return None;
+            return Err(OrgError::InvalidOrg);
         }
 
         let rate_recip = 1.0 / rate as i32 as f32;
@@ -828,8 +863,11 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
             let inst_data_ptr = if n_events == 0 {
                 NonNull::dangling()
             } else {
-                let inst_data =
-                    song.get(ins_data_offset..ins_data_offset + n_events as usize * 8)?;
+                let Some(inst_data) =
+                    song.get(ins_data_offset..ins_data_offset + n_events as usize * 8)
+                else {
+                    return Err(OrgError::InvalidOrg);
+                };
                 // Safety: slice is always valid, and bound checked
                 unsafe { NonNull::new_unchecked(inst_data.as_ptr() as *mut u8) }
             };
@@ -866,8 +904,11 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
             let inst_data_ptr = if n_events == 0 {
                 NonNull::dangling()
             } else {
-                let inst_data =
-                    song.get(ins_data_offset..ins_data_offset + n_events as usize * 8)?;
+                let Some(inst_data) =
+                    song.get(ins_data_offset..ins_data_offset + n_events as usize * 8)
+                else {
+                    return Err(OrgError::InvalidOrg);
+                };
                 // Safety: slice is always valid, and bound checked
                 unsafe { NonNull::new_unchecked(inst_data.as_ptr() as *mut u8) }
             };
@@ -899,12 +940,12 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
 
         // More data after song? Reject.
         if ins_data_offset != song.len() {
-            return None;
+            return Err(OrgError::InvalidOrg);
         }
 
         let song_data = unsafe { NonNull::new_unchecked(song.as_ptr() as *mut u8).add(114) };
 
-        Some(Self {
+        Ok(Self {
             song_data,
             sample_rate_recip: rate_recip,
             samples_per_beat,
@@ -1069,6 +1110,7 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
 }
 
 /// Builder for [`OrgPlay`].
+#[derive(Debug)]
 pub struct OrgPlayBuilder<I, A>(PhantomData<I>, A, u32);
 
 impl OrgPlayBuilder<(), ()> {
@@ -1089,6 +1131,7 @@ impl OrgPlayBuilder<(), ()> {
 }
 
 impl<I, A> OrgPlayBuilder<I, A> {
+    /// Set interpolation.
     pub fn with_interpolation<I2: OrgInterpolation>(self, _: I2) -> OrgPlayBuilder<I2, A> {
         const {
             assert!(
@@ -1099,6 +1142,9 @@ impl<I, A> OrgPlayBuilder<I, A> {
         OrgPlayBuilder(PhantomData, self.1, self.2)
     }
 
+    /// Set sample rate.
+    ///
+    /// Note that sample rate over 1,000,000 may result in [`OrgError::SampleRateTooHigh`].
     /// # Panics
     ///
     /// Panics if `rate` is less than 1000.
@@ -1107,6 +1153,8 @@ impl<I, A> OrgPlayBuilder<I, A> {
         OrgPlayBuilder(self.0, self.1, rate)
     }
 
+    /// Provide original Cave Story wavetable and drums for soundbank.
+    ///
     /// Will only properly play songs with original Cave Story drum sound effects.
     /// See [`CaveStoryAssetProvider`] for more information.
     pub fn with_asset<'a>(
@@ -1117,10 +1165,12 @@ impl<I, A> OrgPlayBuilder<I, A> {
         self.with_soundbank_provider(AssetByRef(wavetable, drum))
     }
 
+    /// Provide [`Soundbank`].
     pub fn with_soundbank(self, a: Soundbank) -> OrgPlayBuilder<I, Soundbank> {
         self.with_soundbank_provider(a)
     }
 
+    /// Provide [`SoundbankProvider`].
     pub fn with_soundbank_provider<A2: SoundbankProvider>(self, a: A2) -> OrgPlayBuilder<I, A2> {
         OrgPlayBuilder(PhantomData, a, self.2)
     }
@@ -1131,8 +1181,8 @@ where
     I: OrgInterpolation,
     A: SoundbankProvider,
 {
-    /// Returns None if song is invalid.
-    pub fn build<'a>(self, song: &'a [u8]) -> Option<OrgPlay<'a, I, A>> {
+    /// Try to build [`OrgPlay`].
+    pub fn build<'a>(self, song: &'a [u8]) -> Result<OrgPlay<'a, I, A>, OrgError> {
         OrgPlay::<I, A>::new(self.1, song, self.2)
     }
 }
