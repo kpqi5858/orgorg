@@ -108,10 +108,8 @@ pub trait CaveStoryAssetProvider {
 /// as [`Soundbank`] and [`CaveStoryAssetProvider`] provides implementation for this trait.
 ///
 /// # Safety
-/// - Return value of [`SoundbankProvider::is_drum_valid`]
-///   must be consistent for given `idx` across all calls.
-/// - If [`SoundbankProvider::is_drum_valid`] returns `true` for given `idx`,
-///   [`SoundbankProvider::get_drum`] must return a slice with `[1, 500000]` length,
+/// - Return value of [`SoundbankProvider::drum`] must be consistent for given `idx` across all calls.
+/// - If [`SoundbankProvider::drum`] returns `Some`, length of the slice must be in `[1, 500000]`,
 ///   and its length must be consistent across all calls.
 ///
 /// In other words, don't tamper with outputs using interior mutability or external source.
@@ -119,14 +117,8 @@ pub unsafe trait SoundbankProvider {
     /// The original `wavetable.dat` file, or 100 concatenated 256-length waves.
     fn wavetable(&self) -> &[OrgSmp; 25600];
 
-    /// The drum channel with `idx` wave will be silenced if this returns `false`.
-    fn is_drum_valid(&self, idx: u8) -> bool;
-
     /// Get drum sample of `idx`.
-    /// # Safety
-    /// Caller must not call this function
-    /// if [`SoundbankProvider::is_drum_valid`] with given `idx` would return `false`.
-    unsafe fn get_drum(&self, idx: u8) -> &[OrgSmp];
+    fn drum(&self, idx: u8) -> Option<&[OrgSmp]>;
 }
 
 // Safety: All function is consistent.
@@ -137,25 +129,19 @@ unsafe impl<T: CaveStoryAssetProvider> SoundbankProvider for T {
     }
 
     #[inline(always)]
-    fn is_drum_valid(&self, idx: u8) -> bool {
-        matches!(idx, 0 | 2 | 4 | 5 | 6 | 8)
-    }
-
-    #[inline(always)]
-    unsafe fn get_drum(&self, idx: u8) -> &[OrgSmp] {
-        let drums = CaveStoryAssetProvider::drum(self).as_ptr();
-        unsafe {
-            let range = match idx {
-                0 => (0, 5000),
-                2 => (5000, 10000),
-                4 => (15000, 10000),
-                5 => (25000, 1000),
-                6 => (26000, 10000),
-                8 => (36000, 4000),
-                _ => core::hint::unreachable_unchecked(),
-            };
-            core::slice::from_raw_parts(drums.add(range.0), range.1)
-        }
+    fn drum(&self, idx: u8) -> Option<&[OrgSmp]> {
+        let drums = CaveStoryAssetProvider::drum(self);
+        let range = match idx {
+            0 => (0, 5000),
+            2 => (5000, 10000),
+            4 => (15000, 10000),
+            5 => (25000, 1000),
+            6 => (26000, 10000),
+            8 => (36000, 4000),
+            _ => return None,
+        };
+        // Avoid panic code. Compiler can't prove it.
+        unsafe { Some(drums.get_unchecked(range.0..range.0 + range.1)) }
     }
 }
 
@@ -202,14 +188,9 @@ unsafe impl SoundbankProvider for Soundbank<'_> {
     }
 
     #[inline(always)]
-    fn is_drum_valid(&self, idx: u8) -> bool {
-        let len = self.drums.get(idx as usize).map(|x| x.len()).unwrap_or(0);
-        (1..=MAX_DRUM_LEN).contains(&len)
-    }
-
-    #[inline(always)]
-    unsafe fn get_drum(&self, idx: u8) -> &[OrgSmp] {
-        unsafe { self.drums.get_unchecked(idx as usize) }
+    fn drum(&self, idx: u8) -> Option<&[OrgSmp]> {
+        let drum = self.drums.get(idx as usize)?;
+        (1..=MAX_DRUM_LEN).contains(&drum.len()).then_some(drum)
     }
 }
 
@@ -637,8 +618,7 @@ impl<const DRUM: bool> Instrument<DRUM> {
         // Safety: See wave_idx field comment
         let cur_wave = unsafe {
             if DRUM {
-                debug_assert!(a.is_drum_valid(self.wave_idx));
-                a.get_drum(self.wave_idx)
+                a.drum(self.wave_idx).unwrap_unchecked()
             } else {
                 debug_assert!((0..100).contains(&self.wave_idx));
                 let idx = self.wave_idx as usize * 256;
@@ -880,7 +860,7 @@ impl<'a, I: OrgInterpolation, A: SoundbankProvider> OrgPlay<'a, I, A> {
         }
         for val in &mut drum_ins {
             let wave = song_reader.read_u8(offset + 2);
-            let valid_wave = asset.is_drum_valid(wave);
+            let valid_wave = asset.drum(wave).is_some();
             let n_events = song_reader.read_u16(offset + 4);
             let pi = song_reader.read_u8(offset + 3) != 0;
             let inst_data_ptr = if n_events == 0 {
@@ -1217,12 +1197,8 @@ mod test {
                 unreachable!()
             }
 
-            fn is_drum_valid(&self, _idx: u8) -> bool {
-                true
-            }
-
-            unsafe fn get_drum(&self, _idx: u8) -> &[OrgSmp] {
-                &self.0
+            fn drum(&self, _idx: u8) -> Option<&[OrgSmp]> {
+                Some(&self.0)
             }
         }
         let soundbank = TestSoundbank(test_sample);
