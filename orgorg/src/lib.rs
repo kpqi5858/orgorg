@@ -74,10 +74,14 @@
 //! If you want numbers, my x86 PC can synthesize Cave Story Main Theme at over 7800x speed.
 //! (Linear Interpolation, 48000 Hz Stereo, `fma` & `f32smp`).
 
-use core::{cmp, marker::PhantomData, mem::MaybeUninit, num::Wrapping, ptr::NonNull};
-use std::{
+use core::{
+    cmp,
     error::Error,
     fmt::{Debug, Display},
+    marker::PhantomData,
+    mem::MaybeUninit,
+    num::Wrapping,
+    ptr::NonNull,
 };
 
 const MASTER_VOLUME: f32 = 1.0 / (1 << 19) as f32;
@@ -781,7 +785,7 @@ pub enum OrgError {
 }
 
 impl Display for OrgError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let s = match self {
             OrgError::InvalidOrg => "Invalid Organya song",
             OrgError::SampleRateTooHigh => "Sample rate is too high",
